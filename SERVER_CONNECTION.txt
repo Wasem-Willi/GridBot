@@ -76,3 +76,30 @@ git pull origin v2
 
 Push local commits to v2:
 git push -u origin v2
+
+9) Start from scratch on the server
+-----------------------------------
+Option A - fresh restart (keep code and DB):
+cd /opt/GridBot
+docker compose down
+docker compose up -d --build
+docker compose logs -f gridbot
+
+Option B - fresh code deploy (keep DB and .env):
+cd /opt/GridBot
+docker compose down
+git fetch origin
+git checkout v2
+git reset --hard origin/v2
+docker compose up -d --build
+docker compose logs -f gridbot
+
+Option C - full clean slate (delete bot DB/state):
+cd /opt/GridBot
+docker compose down
+rm -rf data/*
+git fetch origin
+git checkout v2
+git reset --hard origin/v2
+docker compose up -d --build
+docker compose logs -f gridbot
