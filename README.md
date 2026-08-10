@@ -6,6 +6,7 @@ This project scaffolds a real-money-ready **grid trading bot** with strict safet
 - Dynamic symbol rotation (hourly)
 - 1-minute control loop
 - Daily loss stop + per-symbol stop-loss/take-profit bands
+- Reconciliation safety gate (position/quote/equity drift checks with global halt)
 - Telegram alerts + `/kill` and `/resume` commands
 - SQLite state store
 - Docker Compose deployment
@@ -41,6 +42,7 @@ cp .env.example .env
 - `COMMAND_POLL_SECONDS` in `.env` controls Telegram command responsiveness (default 5 seconds)
 - `HEARTBEAT_MINUTES` controls automatic Telegram heartbeat cadence (1-5 minutes)
 - `INSUFFICIENT_FUNDS_RETRY_MINUTES` controls auto-retry cooldown for symbols paused due to insufficient funds
+- `RECONCILIATION_*` values control startup/loop drift checks and clean-cycle recovery gate after a breach
 
 ## 3) Run locally (Python)
 
@@ -99,3 +101,15 @@ The bot also sends an automatic heartbeat every `HEARTBEAT_MINUTES` with status,
 - Account-equity P/L snapshots are available in `testnet/live` modes via `/pnl` and included in `/status`.
 - The fallback from stale maker orders to taker orders should be added next as a latency- and slippage-aware policy.
 - Fill-by-fill realized PnL tracking is not wired yet; daily report field "Realized PnL today" remains 0 unless explicitly recorded.
+
+## 8) Safety reconciliation behavior
+
+- In `testnet/live`, the bot can run reconciliation checks against exchange balances/equity.
+- If drift exceeds thresholds, the bot performs a global halt and records a `reconciliation_breach` risk event.
+- After a reconciliation breach, manual `/resume` remains blocked until the configured number of consecutive clean cycles is reached.
+- Threshold and recovery settings are configured via:
+   - `RECONCILIATION_ENABLED`
+   - `RECONCILIATION_QTY_DRIFT_PCT` (default `0.001` = 0.1%)
+   - `RECONCILIATION_EQUITY_DRIFT_USDT` (default `5`)
+   - `RECONCILIATION_CLEAN_CYCLES_REQUIRED` (default `3`)
+   - `RECONCILIATION_CHECK_ON_HALT` (default `true`)

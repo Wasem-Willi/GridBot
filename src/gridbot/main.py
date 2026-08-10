@@ -15,6 +15,13 @@ from gridbot.exchange import BinanceSpotClient, extract_binance_error_detail
 from gridbot.execution import ExecutionConfig, InsufficientFundsError, OrderPlacementError, sync_grid_orders
 from gridbot.grid_engine import build_grid, is_outside_grid
 from gridbot.pnl import compute_live_pnl_snapshot
+from gridbot.reconciliation import (
+    ReconciliationResult,
+    build_exchange_snapshot,
+    load_local_snapshot,
+    reconcile_snapshots,
+    save_local_snapshot,
+)
 from gridbot.reporting import build_daily_summary
 from gridbot.risk_guard import check_daily_loss_limit, check_symbol_band
 from gridbot.selector import select_symbols
@@ -240,6 +247,50 @@ def _should_retry_insufficient_funds(state_updated_at: str, now: datetime, retry
     return now - updated_at >= timedelta(minutes=retry_minutes)
 
 
+def _build_reconciliation_status(result: ReconciliationResult) -> str:
+    if result.is_clean:
+        return (
+            "Reconciliation clean: "
+            f"qty_drift_pct={result.max_qty_drift_pct:.6f}, "
+            f"quote_drift_usdt={result.quote_drift_usdt:.6f}, "
+            f"equity_drift_usdt={result.equity_drift_usdt:.6f}"
+        )
+    return f"Reconciliation breach: {result.reason}"
+
+
+def _run_reconciliation_check(cfg: BotConfig, exchange: BinanceSpotClient, store: StateStore) -> ReconciliationResult:
+    exchange_snapshot = build_exchange_snapshot(exchange)
+    local_snapshot = load_local_snapshot(store)
+    result = reconcile_snapshots(
+        local_snapshot,
+        exchange_snapshot,
+        qty_drift_pct_threshold=cfg.reconciliation_qty_drift_pct,
+        equity_drift_usdt_threshold=cfg.reconciliation_equity_drift_usdt,
+    )
+    save_local_snapshot(store, exchange_snapshot)
+    return result
+
+
+def _run_startup_safety_gate(
+    cfg: BotConfig,
+    exchange: BinanceSpotClient,
+    store: StateStore,
+    symbols: list[str],
+) -> None:
+    if cfg.dry_run or not cfg.reconciliation_enabled:
+        return
+
+    result = _run_reconciliation_check(cfg, exchange, store)
+    if not result.is_clean and result.reason != "bootstrap":
+        raise RuntimeError(f"Startup reconciliation failed: {_build_reconciliation_status(result)}")
+
+    for symbol in symbols:
+        price = exchange.get_ticker_price(symbol)
+        state = store.get_symbol_state(symbol)
+        center = state.center_price if state is not None else price
+        build_grid(symbol, center, cfg.grid_spacing_pct, cfg.grid_levels, cfg.per_symbol_capital)
+
+
 def run() -> None:
     _setup_logging()
     cfg = load_config()
@@ -266,10 +317,16 @@ def run() -> None:
                 "For MODE=testnet, verify testnet key/secret pair and endpoint."
             ) from error
     active_symbols = _refresh_symbols(cfg, exchange, blacklist, alerter)
+    _run_startup_safety_gate(cfg, exchange, store, active_symbols)
     next_symbol_refresh = datetime.now(tz) + timedelta(minutes=cfg.symbol_refresh_minutes)
     next_heartbeat = datetime.now(tz) + timedelta(minutes=cfg.heartbeat_minutes)
     last_report_day = store.get_state("last_report_day")
     bot_halted = store.get_state("bot_halted") == "1"
+    clean_cycles_key = "reconciliation_clean_cycles"
+    clean_cycles_raw = store.get_state(clean_cycles_key)
+    clean_cycles = int(clean_cycles_raw) if clean_cycles_raw is not None else 0
+    resume_block_key = "reconciliation_resume_block"
+    resume_block_active = store.get_state(resume_block_key) == "1"
 
     alerter.send("GridBot boot complete.")
     try:
@@ -312,7 +369,53 @@ def run() -> None:
                 next_heartbeat = now + timedelta(minutes=cfg.heartbeat_minutes)
 
             store.set_state("bot_halted", "1" if bot_halted else "0")
+
+            if cfg.reconciliation_enabled and (not bot_halted or cfg.reconciliation_check_on_halt) and not cfg.dry_run:
+                rec_result = _run_reconciliation_check(cfg, exchange, store)
+                logging.info(_build_reconciliation_status(rec_result))
+                if rec_result.is_clean:
+                    clean_cycles += 1
+                    store.set_state(clean_cycles_key, str(clean_cycles))
+                    if resume_block_active and clean_cycles >= cfg.reconciliation_clean_cycles_required:
+                        resume_block_active = False
+                        store.set_state(resume_block_key, "0")
+                        alerter.send("Reconciliation recovery gate satisfied. Manual /resume now allowed.")
+                else:
+                    clean_cycles = 0
+                    store.set_state(clean_cycles_key, "0")
+                    resume_block_active = True
+                    store.set_state(resume_block_key, "1")
+                    if not bot_halted:
+                        bot_halted = True
+                        store.set_state("bot_halted", "1")
+                        store.log_risk_event(
+                            "reconciliation_breach",
+                            None,
+                            {
+                                "reason": rec_result.reason,
+                                "qty_drift_pct": rec_result.max_qty_drift_pct,
+                                "quote_drift_usdt": rec_result.quote_drift_usdt,
+                                "equity_drift_usdt": rec_result.equity_drift_usdt,
+                            },
+                        )
+                        alerter.send(f"GridBot halted: {_build_reconciliation_status(rec_result)}")
+
+            if resume_block_active and clean_cycles < cfg.reconciliation_clean_cycles_required:
+                if not bot_halted:
+                    bot_halted = True
+                    store.set_state("bot_halted", "1")
+                    remaining = cfg.reconciliation_clean_cycles_required - clean_cycles
+                    alerter.send(
+                        "Resume blocked by reconciliation gate. "
+                        f"Required clean cycles remaining: {remaining}."
+                    )
+
             if bot_halted:
+                if cfg.reconciliation_enabled and cfg.reconciliation_check_on_halt and not cfg.dry_run:
+                    required = cfg.reconciliation_clean_cycles_required
+                    if clean_cycles < required:
+                        remaining = required - clean_cycles
+                        logging.info("Halt recovery pending clean cycles: %s remaining", remaining)
                 bot_halted, should_stop = _responsive_wait(
                     cfg.loop_seconds,
                     cfg.command_poll_seconds,
@@ -334,6 +437,11 @@ def run() -> None:
                     pnl_provider,
                     cancel_all_provider,
                 )
+                if cfg.reconciliation_enabled and bot_halted and not cfg.dry_run:
+                    required = cfg.reconciliation_clean_cycles_required
+                    if clean_cycles < required:
+                        bot_halted = True
+                        store.set_state("bot_halted", "1")
                 store.set_state("bot_halted", "1" if bot_halted else "0")
                 if should_stop or bot_halted:
                     break

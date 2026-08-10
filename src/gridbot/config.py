@@ -60,6 +60,11 @@ class BotConfig:
     command_poll_seconds: int
     heartbeat_minutes: int
     insufficient_funds_retry_minutes: int
+    reconciliation_enabled: bool
+    reconciliation_qty_drift_pct: float
+    reconciliation_equity_drift_usdt: float
+    reconciliation_clean_cycles_required: int
+    reconciliation_check_on_halt: bool
     max_active_symbols: int
     max_symbol_capital_pct: float
     binance_base_url: str
@@ -100,6 +105,16 @@ def load_config() -> BotConfig:
     insufficient_funds_retry_minutes = int(_get_env("INSUFFICIENT_FUNDS_RETRY_MINUTES", "10"))
     if insufficient_funds_retry_minutes < 1:
         raise ValueError("INSUFFICIENT_FUNDS_RETRY_MINUTES must be >= 1")
+    reconciliation_enabled = _get_bool("RECONCILIATION_ENABLED", mode in {"testnet", "live"})
+    reconciliation_qty_drift_pct = float(_get_env("RECONCILIATION_QTY_DRIFT_PCT", "0.001"))
+    if reconciliation_qty_drift_pct < 0:
+        raise ValueError("RECONCILIATION_QTY_DRIFT_PCT must be >= 0")
+    reconciliation_equity_drift_usdt = float(_get_env("RECONCILIATION_EQUITY_DRIFT_USDT", "5"))
+    if reconciliation_equity_drift_usdt < 0:
+        raise ValueError("RECONCILIATION_EQUITY_DRIFT_USDT must be >= 0")
+    reconciliation_clean_cycles_required = int(_get_env("RECONCILIATION_CLEAN_CYCLES_REQUIRED", "3"))
+    if reconciliation_clean_cycles_required < 1:
+        raise ValueError("RECONCILIATION_CLEAN_CYCLES_REQUIRED must be >= 1")
 
     return BotConfig(
         mode=mode,
@@ -119,6 +134,11 @@ def load_config() -> BotConfig:
         command_poll_seconds=int(_get_env("COMMAND_POLL_SECONDS", "5")),
         heartbeat_minutes=heartbeat_minutes,
         insufficient_funds_retry_minutes=insufficient_funds_retry_minutes,
+        reconciliation_enabled=reconciliation_enabled,
+        reconciliation_qty_drift_pct=reconciliation_qty_drift_pct,
+        reconciliation_equity_drift_usdt=reconciliation_equity_drift_usdt,
+        reconciliation_clean_cycles_required=reconciliation_clean_cycles_required,
+        reconciliation_check_on_halt=_get_bool("RECONCILIATION_CHECK_ON_HALT", True),
         max_active_symbols=int(_get_env("MAX_ACTIVE_SYMBOLS", "5")),
         max_symbol_capital_pct=float(_get_env("MAX_SYMBOL_CAPITAL_PCT", "0.20")),
         binance_base_url=base_url,
