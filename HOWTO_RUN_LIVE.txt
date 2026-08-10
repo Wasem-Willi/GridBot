@@ -1,0 +1,77 @@
+GridBot Full How-To (Windows PowerShell, Live Mode)
+
+1) Open PowerShell
+- Press Start
+- Type PowerShell
+- Open Windows PowerShell
+
+2) Go to bot folder
+Set-Location "C:\Users\wwilli\OneDrive - Intel Corporation\Private\GridBot"
+
+3) Allow script activation for this terminal only
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+4) Activate virtual environment
+.venv\Scripts\Activate.ps1
+
+5) Install/update dependencies
+python -m pip install --no-cache-dir --retries 20 --timeout 60 -r requirements.txt
+
+6) Edit .env for LIVE mode with $100
+Set these values:
+MODE=live
+BINANCE_BASE_URL=https://api.binance.com
+CAPITAL_USDT=100
+BINANCE_API_KEY=YOUR_LIVE_KEY
+BINANCE_API_SECRET=YOUR_LIVE_SECRET
+TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID=YOUR_CHAT_ID
+HEARTBEAT_MINUTES=3
+COMMAND_POLL_SECONDS=3
+
+7) Ensure no old bot process is running
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -match '^python(\.exe)?$' -and $_.CommandLine -match 'gridbot\.main' } |
+  Select-Object ProcessId, CommandLine
+
+If PIDs are shown, stop them:
+Stop-Process -Id <PID1>
+Stop-Process -Id <PID2>
+
+8) Set PYTHONPATH for this terminal
+$env:PYTHONPATH="src"
+
+9) Start the bot
+python -m gridbot.main
+
+10) Verify in Telegram
+/help
+/status
+/pnl
+/resume   (if status is STOPPED)
+
+11) Runtime commands
+/transitions -> show latest transition/risk events
+/cancel_all  -> cancel all open spot orders
+/kill   -> pause trading loop
+/resume -> resume trading loop
+/stop   -> stop bot process
+
+12) If startup fails with Binance timeout (api.binance.com connect timeout)
+Run connectivity check:
+curl https://api.binance.com/api/v3/ping
+
+If blocked on corporate network, set proxy in this terminal:
+$env:HTTPS_PROXY="http://proxy-dmz.intel.com:911"
+$env:HTTP_PROXY="http://proxy-dmz.intel.com:911"
+
+Then retry:
+$env:PYTHONPATH="src"
+python -m gridbot.main
+
+If it still fails, run the bot from a network/VPS where Binance is reachable.
+
+13) Reset paused symbol state (when symbols stay paused and no new orders are created)
+python -c "import sqlite3; p=r'C:\Users\wwilli\OneDrive - Intel Corporation\Private\GridBot\data\gridbot.db'; c=sqlite3.connect(p); c.execute('DELETE FROM symbol_state'); c.commit(); c.close(); print('symbol_state cleared')"
+
+python -c "import sqlite3; p=r'C:\Users\wwilli\OneDrive - Intel Corporation\Private\GridBot\data\gridbot.db'; c=sqlite3.connect(p); c.execute('DELETE FROM symbol_state'); c.commit(); c.close(); print('symbol_state cleared')"; $env:PYTHONPATH="src"; python -m gridbot.main
