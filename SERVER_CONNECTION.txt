@@ -1,0 +1,48 @@
+GridBot Server Connection (Hetzner)
+===================================
+
+1) Connect from Windows PowerShell
+----------------------------------
+ssh root@46.62.138.19
+
+If first connection asks to trust host, type:
+yes
+
+2) If SSH says "Permission denied"
+----------------------------------
+- Make sure username is: root
+- Type password manually (it will not show while typing)
+- Verify keyboard layout is correct (English)
+
+3) Test SSH port from Windows
+-----------------------------
+Test-NetConnection 46.62.138.19 -Port 22
+
+Expected:
+TcpTestSucceeded : True
+
+4) If still blocked, use Hetzner Web Console
+--------------------------------------------
+Open server console from Hetzner panel, then run:
+
+systemctl status ssh
+systemctl restart ssh
+ss -tlnp | grep :22
+
+5) Security after first login
+-----------------------------
+Change root password:
+passwd
+
+Recommended next:
+- Add your SSH public key to /root/.ssh/authorized_keys
+- Disable password login later (after key auth works)
+
+6) Deploy commands after login
+------------------------------
+cd /opt
+git clone YOUR_GIT_REPO_URL GridBot
+cd /opt/GridBot
+cp .env.example .env
+docker compose up -d --build
+docker compose logs -f gridbot
