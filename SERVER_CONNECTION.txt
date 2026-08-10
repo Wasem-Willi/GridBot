@@ -46,3 +46,12 @@ cd /opt/GridBot
 cp .env.example .env
 docker compose up -d --build
 docker compose logs -f gridbot
+
+7) Stop running Docker containers
+---------------------------------
+Stop all running containers:
+docker stop $(docker ps -q)
+
+Stop only GridBot stack:
+cd /opt/GridBot
+docker compose down
