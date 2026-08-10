@@ -40,7 +40,6 @@ cp .env.example .env
 - `.env` - risk and runtime config
 - `MODE` in `.env` is the one-line environment switch: `paper|testnet|live`
 - `COMMAND_POLL_SECONDS` in `.env` controls Telegram command responsiveness (default 5 seconds)
-- `HEARTBEAT_MINUTES` controls automatic Telegram heartbeat cadence (1-5 minutes)
 - `INSUFFICIENT_FUNDS_RETRY_MINUTES` controls auto-retry cooldown for symbols paused due to insufficient funds
 - `RECONCILIATION_*` values control startup/loop drift checks and clean-cycle recovery gate after a breach
 
@@ -80,8 +79,6 @@ docker compose logs -f gridbot
 - `/stop` - stop the bot process
 - `/status` - current bot state + latest P/L snapshot
 - `/pnl` - on-demand near-live account equity P/L snapshot (testnet/live)
-
-The bot also sends an automatic heartbeat every `HEARTBEAT_MINUTES` with status, active symbols, and P/L snapshot.
 
 ## 6) Rollout path (recommended)
 

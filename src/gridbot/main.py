@@ -223,11 +223,6 @@ def _build_help_text() -> str:
     )
 
 
-def _build_heartbeat_text(status: str, active_symbols: list[str], pnl_text: str) -> str:
-    symbols = ", ".join(active_symbols) if active_symbols else "none"
-    return f"[Heartbeat]\nStatus: {status}\nActive symbols: {symbols}\n{pnl_text}"
-
-
 def _build_transitions_text(store: StateStore, limit: int = 10) -> str:
     events = store.get_recent_risk_events(limit=limit)
     if not events:
@@ -319,7 +314,6 @@ def run() -> None:
     active_symbols = _refresh_symbols(cfg, exchange, blacklist, alerter)
     _run_startup_safety_gate(cfg, exchange, store, active_symbols)
     next_symbol_refresh = datetime.now(tz) + timedelta(minutes=cfg.symbol_refresh_minutes)
-    next_heartbeat = datetime.now(tz) + timedelta(minutes=cfg.heartbeat_minutes)
     last_report_day = store.get_state("last_report_day")
     bot_halted = store.get_state("bot_halted") == "1"
     clean_cycles_key = "reconciliation_clean_cycles"
@@ -357,16 +351,6 @@ def run() -> None:
                 alerter.send(
                     f"GridBot halted: daily loss limit hit. pnl={risk.realized_pnl:.4f}, threshold={risk.threshold:.4f}"
                 )
-
-            if now >= next_heartbeat:
-                status = "STOPPED" if bot_halted else "RUNNING"
-                try:
-                    pnl_text = pnl_provider()
-                except (requests.RequestException, ValueError) as error:
-                    logging.warning("P/L snapshot failed for heartbeat: %s", error)
-                    pnl_text = "P/L update unavailable right now (exchange/API error)."
-                alerter.send(_build_heartbeat_text(status, active_symbols, pnl_text))
-                next_heartbeat = now + timedelta(minutes=cfg.heartbeat_minutes)
 
             store.set_state("bot_halted", "1" if bot_halted else "0")
 

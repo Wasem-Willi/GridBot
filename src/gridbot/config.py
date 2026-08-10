@@ -58,7 +58,6 @@ class BotConfig:
     symbol_refresh_minutes: int
     loop_seconds: int
     command_poll_seconds: int
-    heartbeat_minutes: int
     insufficient_funds_retry_minutes: int
     reconciliation_enabled: bool
     reconciliation_qty_drift_pct: float
@@ -99,9 +98,6 @@ def load_config() -> BotConfig:
             "MODE=live but BINANCE_BASE_URL points to testnet. "
             "Set BINANCE_BASE_URL=https://api.binance.com or remove BINANCE_BASE_URL."
         )
-    heartbeat_minutes = int(_get_env("HEARTBEAT_MINUTES", "5"))
-    if heartbeat_minutes < 1 or heartbeat_minutes > 5:
-        raise ValueError("HEARTBEAT_MINUTES must be between 1 and 5")
     insufficient_funds_retry_minutes = int(_get_env("INSUFFICIENT_FUNDS_RETRY_MINUTES", "10"))
     if insufficient_funds_retry_minutes < 1:
         raise ValueError("INSUFFICIENT_FUNDS_RETRY_MINUTES must be >= 1")
@@ -132,7 +128,6 @@ def load_config() -> BotConfig:
         symbol_refresh_minutes=int(_get_env("SYMBOL_REFRESH_MINUTES", "60")),
         loop_seconds=int(_get_env("LOOP_SECONDS", "60")),
         command_poll_seconds=int(_get_env("COMMAND_POLL_SECONDS", "5")),
-        heartbeat_minutes=heartbeat_minutes,
         insufficient_funds_retry_minutes=insufficient_funds_retry_minutes,
         reconciliation_enabled=reconciliation_enabled,
         reconciliation_qty_drift_pct=reconciliation_qty_drift_pct,
