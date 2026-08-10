@@ -55,3 +55,24 @@ docker stop $(docker ps -q)
 Stop only GridBot stack:
 cd /opt/GridBot
 docker compose down
+
+8) Basic Git usage on the server
+--------------------------------
+Go to project folder:
+cd /opt/GridBot
+
+Check current branch and status:
+git branch
+git status
+
+Get latest changes from remote:
+git fetch origin
+
+Switch to v2 branch:
+git checkout v2
+
+Pull latest updates for v2:
+git pull origin v2
+
+Push local commits to v2:
+git push -u origin v2
