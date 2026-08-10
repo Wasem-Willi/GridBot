@@ -48,6 +48,7 @@ def _apply_control_commands(
     bot_halted: bool,
     pnl_provider: Callable[[], str],
     cancel_all_provider: Callable[[], str],
+    start_fresh_provider: Callable[[], tuple[bool, str]],
 ) -> tuple[bool, bool]:
     offset_raw = store.get_state("telegram_offset")
     offset = int(offset_raw) if offset_raw is not None else 0
@@ -93,6 +94,21 @@ def _apply_control_commands(
                 cancel_message = f"Cancel all failed: {error}"
             alerter.send(cancel_message)
             store.log_risk_event("manual_cancel_all", None, {"source": "telegram", "result": cancel_message})
+        elif command.name == "start_fresh":
+            try:
+                success, fresh_message = start_fresh_provider()
+            except (requests.RequestException, ValueError) as error:
+                success = False
+                fresh_message = f"Start fresh failed: {error}"
+            if success:
+                bot_halted = False
+                store.set_state("bot_halted", "0")
+            alerter.send(fresh_message)
+            store.log_risk_event(
+                "manual_start_fresh",
+                None,
+                {"source": "telegram", "success": 1 if success else 0, "result": fresh_message},
+            )
     return bot_halted, should_stop
 
 
@@ -139,6 +155,7 @@ def _responsive_wait(
     bot_halted: bool,
     pnl_provider: Callable[[], str],
     cancel_all_provider: Callable[[], str],
+    start_fresh_provider: Callable[[], tuple[bool, str]],
 ) -> tuple[bool, bool]:
     remaining = max(wait_seconds, 0)
     step = max(poll_seconds, 1)
@@ -152,6 +169,7 @@ def _responsive_wait(
             bot_halted,
             pnl_provider,
             cancel_all_provider,
+            start_fresh_provider,
         )
         store.set_state("bot_halted", "1" if bot_halted else "0")
         if should_stop:
@@ -209,6 +227,44 @@ def _make_cancel_all_provider(cfg: BotConfig, exchange: BinanceSpotClient) -> Ca
     return _provider
 
 
+def _make_start_fresh_provider(
+    cfg: BotConfig,
+    exchange: BinanceSpotClient,
+    store: StateStore,
+) -> Callable[[], tuple[bool, str]]:
+    def _provider() -> tuple[bool, str]:
+        if cfg.mode == "paper":
+            store.reset_for_fresh_start()
+            return True, "Start fresh completed: paper mode state was reset."
+
+        open_orders = exchange.get_all_open_orders()
+        symbols = sorted({str(order.get("symbol", "")) for order in open_orders if order.get("symbol")})
+        canceled_total = 0
+        failures: list[str] = []
+        for symbol in symbols:
+            try:
+                canceled = exchange.cancel_all_orders(symbol)
+                canceled_total += len(canceled)
+            except requests.HTTPError as error:
+                failures.append(f"{symbol} ({extract_binance_error_detail(error)})")
+
+        if failures:
+            failure_text = "; ".join(failures)
+            return (
+                False,
+                "Start fresh aborted: cancel all failed for one or more symbols. "
+                f"Local state was not reset. Failures: {failure_text}",
+            )
+
+        store.reset_for_fresh_start()
+        return (
+            True,
+            f"Start fresh completed: canceled_open_orders={canceled_total}, symbols={len(symbols)}, local_state_reset=true.",
+        )
+
+    return _provider
+
+
 def _build_help_text() -> str:
     return (
         "GridBot commands:\n"
@@ -217,6 +273,7 @@ def _build_help_text() -> str:
         "/pnl - on-demand P/L snapshot\n"
         "/transitions - latest transition events\n"
         "/cancel_all - cancel all open spot orders\n"
+        "/start_fresh - cancel all open orders, reset local state, and restart fresh\n"
         "/kill - halt trading loop\n"
         "/resume - resume trading\n"
         "/stop - stop bot process"
@@ -286,6 +343,17 @@ def _run_startup_safety_gate(
         build_grid(symbol, center, cfg.grid_spacing_pct, cfg.grid_levels, cfg.per_symbol_capital)
 
 
+def _load_reconciliation_gate_state(
+    store: StateStore,
+    clean_cycles_key: str,
+    resume_block_key: str,
+) -> tuple[int, bool]:
+    clean_cycles_raw = store.get_state(clean_cycles_key)
+    clean_cycles = int(clean_cycles_raw) if clean_cycles_raw is not None else 0
+    resume_block_active = store.get_state(resume_block_key) == "1"
+    return clean_cycles, resume_block_active
+
+
 def run() -> None:
     _setup_logging()
     cfg = load_config()
@@ -296,6 +364,7 @@ def run() -> None:
     alerter = TelegramAlerter(cfg.telegram_bot_token, cfg.telegram_chat_id)
     pnl_provider = _make_pnl_provider(cfg, exchange, store)
     cancel_all_provider = _make_cancel_all_provider(cfg, exchange)
+    start_fresh_provider = _make_start_fresh_provider(cfg, exchange, store)
 
     blacklist = _load_blacklist(cfg.blacklist_path)
     tz = ZoneInfo(cfg.timezone_name)
@@ -317,10 +386,12 @@ def run() -> None:
     last_report_day = store.get_state("last_report_day")
     bot_halted = store.get_state("bot_halted") == "1"
     clean_cycles_key = "reconciliation_clean_cycles"
-    clean_cycles_raw = store.get_state(clean_cycles_key)
-    clean_cycles = int(clean_cycles_raw) if clean_cycles_raw is not None else 0
     resume_block_key = "reconciliation_resume_block"
-    resume_block_active = store.get_state(resume_block_key) == "1"
+    clean_cycles, resume_block_active = _load_reconciliation_gate_state(
+        store,
+        clean_cycles_key,
+        resume_block_key,
+    )
 
     alerter.send("GridBot boot complete.")
     try:
@@ -332,9 +403,15 @@ def run() -> None:
                 bot_halted,
                 pnl_provider,
                 cancel_all_provider,
+                start_fresh_provider,
             )
             if should_stop:
                 break
+            clean_cycles, resume_block_active = _load_reconciliation_gate_state(
+                store,
+                clean_cycles_key,
+                resume_block_key,
+            )
 
             if now >= next_symbol_refresh:
                 active_symbols = _refresh_symbols(cfg, exchange, blacklist, alerter)
@@ -408,6 +485,7 @@ def run() -> None:
                     bot_halted,
                     pnl_provider,
                     cancel_all_provider,
+                    start_fresh_provider,
                 )
                 if should_stop:
                     break
@@ -420,8 +498,14 @@ def run() -> None:
                     bot_halted,
                     pnl_provider,
                     cancel_all_provider,
+                    start_fresh_provider,
                 )
                 if cfg.reconciliation_enabled and bot_halted and not cfg.dry_run:
+                    clean_cycles, resume_block_active = _load_reconciliation_gate_state(
+                        store,
+                        clean_cycles_key,
+                        resume_block_key,
+                    )
                     required = cfg.reconciliation_clean_cycles_required
                     if clean_cycles < required:
                         bot_halted = True
@@ -562,6 +646,7 @@ def run() -> None:
                 bot_halted,
                 pnl_provider,
                 cancel_all_provider,
+                start_fresh_provider,
             )
             if should_stop:
                 break

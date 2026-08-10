@@ -57,6 +57,8 @@ class TelegramAlerter:
                 commands.append(ControlCommand(name="transitions"))
             elif text == "/cancel_all":
                 commands.append(ControlCommand(name="cancel_all"))
+            elif text == "/start_fresh":
+                commands.append(ControlCommand(name="start_fresh"))
             else:
                 logging.info("Ignoring Telegram command text=%s", text)
         return commands, next_offset

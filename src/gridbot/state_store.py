@@ -243,3 +243,19 @@ class StateStore:
         if row is None:
             return None
         return float(row["equity_usdt"])
+
+    def reset_for_fresh_start(self) -> None:
+        self.conn.execute("DELETE FROM orders")
+        self.conn.execute("DELETE FROM symbol_state")
+        self.conn.execute(
+            """
+            DELETE FROM bot_state
+            WHERE key IN (
+                'bot_halted',
+                'reconciliation_clean_cycles',
+                'reconciliation_resume_block',
+                'reconciliation_local_snapshot'
+            )
+            """
+        )
+        self.conn.commit()

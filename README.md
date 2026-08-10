@@ -74,6 +74,7 @@ docker compose logs -f gridbot
 - `/help` - show available commands
 - `/transitions` - show latest transition/risk events
 - `/cancel_all` - cancel all open spot orders
+- `/start_fresh` - cancel open orders, reset local bot state, and start a fresh grid cycle
 - `/kill` - immediately halt trading loop
 - `/resume` - resume trading manually
 - `/stop` - stop the bot process
