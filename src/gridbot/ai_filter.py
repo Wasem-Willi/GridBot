@@ -22,10 +22,11 @@ class AIDecision:
 
 
 class OpenAIDecisionClient:
-    def __init__(self, api_key: str, model: str, timeout_seconds: int) -> None:
+    def __init__(self, api_key: str, model: str, timeout_seconds: int, system_prompt: str) -> None:
         self._api_key = api_key
         self._model = model
         self._timeout_seconds = timeout_seconds
+        self._system_prompt = system_prompt
         self._endpoint = "https://api.openai.com/v1/chat/completions"
 
     def decide(self, payload: dict[str, Any]) -> AIDecision:
@@ -40,12 +41,7 @@ class OpenAIDecisionClient:
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are a strict trading decision engine. "
-                        "Return JSON only with keys: action, confidence, reason. "
-                        "action must be one of BUY_ONLY, SELL_ONLY, BOTH, PAUSE. "
-                        "confidence must be a float in [0,1]. Keep reason short."
-                    ),
+                    "content": self._system_prompt,
                 },
                 {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
             ],

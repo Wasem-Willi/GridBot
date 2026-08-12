@@ -80,6 +80,7 @@ class BotConfig:
     ai_provider: str
     ai_model: str
     ai_api_key: str
+    ai_prompt_path: Path
     ai_timeout_seconds: int
     ai_recompute_seconds: int
     binance_base_url: str
@@ -160,6 +161,9 @@ def load_config() -> BotConfig:
     ai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if ai_filter_mode != "off" and not ai_api_key:
         raise ValueError("OPENAI_API_KEY is required when AI_FILTER_MODE is shadow/active")
+    ai_prompt_path = Path(_get_env("AI_PROMPT_PATH", "docs/openai-decision-spec.md"))
+    if ai_filter_mode != "off" and not ai_prompt_path.exists():
+        raise ValueError(f"AI_PROMPT_PATH does not exist: {ai_prompt_path}")
     ai_timeout_seconds = int(_get_env("AI_TIMEOUT_SECONDS", "2"))
     if ai_timeout_seconds < 1:
         raise ValueError("AI_TIMEOUT_SECONDS must be >= 1")
@@ -205,6 +209,7 @@ def load_config() -> BotConfig:
         ai_provider=ai_provider,
         ai_model=ai_model,
         ai_api_key=ai_api_key,
+        ai_prompt_path=ai_prompt_path,
         ai_timeout_seconds=ai_timeout_seconds,
         ai_recompute_seconds=ai_recompute_seconds,
         binance_base_url=base_url,

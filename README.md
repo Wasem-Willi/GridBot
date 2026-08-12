@@ -161,6 +161,7 @@ Env keys:
 - `AI_PROVIDER` = `openai`
 - `AI_MODEL` (for example `gpt-4o-mini`)
 - `OPENAI_API_KEY`
+- `AI_PROMPT_PATH` (for example `docs/openai-decision-spec.md`)
 - `AI_TIMEOUT_SECONDS` (default `2`)
 - `AI_RECOMPUTE_SECONDS` (default `300`)
 

@@ -500,7 +500,15 @@ class AIFilterController:
         self._cfg = cfg
         self._store = store
         self._alerter = alerter
-        self._client = OpenAIDecisionClient(cfg.ai_api_key, cfg.ai_model, cfg.ai_timeout_seconds)
+        system_prompt = cfg.ai_prompt_path.read_text(encoding="utf-8").strip()
+        if not system_prompt:
+            raise ValueError(f"AI prompt file is empty: {cfg.ai_prompt_path}")
+        self._client = OpenAIDecisionClient(
+            cfg.ai_api_key,
+            cfg.ai_model,
+            cfg.ai_timeout_seconds,
+            system_prompt=system_prompt,
+        )
         self._state: dict[str, dict[str, object]] = {}
 
     @property
@@ -584,7 +592,7 @@ def run() -> None:
     regime = RegimeController(cfg, exchange, store, alerter)
     ai_filter = AIFilterController(cfg, store, alerter)
     logging.info("Regime filter mode=%s", cfg.regime_filter_mode)
-    logging.info("AI filter mode=%s model=%s", cfg.ai_filter_mode, cfg.ai_model)
+    logging.info("AI filter mode=%s model=%s prompt=%s", cfg.ai_filter_mode, cfg.ai_model, cfg.ai_prompt_path)
 
     blacklist = _load_blacklist(cfg.blacklist_path)
     tz = ZoneInfo(cfg.timezone_name)
