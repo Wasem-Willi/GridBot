@@ -177,6 +177,28 @@ class BinanceSpotClient:
         result = self._request("GET", "/api/v3/ticker/price", {"symbol": symbol})
         return float(result["price"])
 
+    def get_klines(self, symbol: str, interval: str, limit: int) -> list[dict[str, float]]:
+        result = self._request(
+            "GET",
+            "/api/v3/klines",
+            {"symbol": symbol, "interval": interval, "limit": limit},
+        )
+        if not isinstance(result, list):
+            raise ValueError("Expected list from klines endpoint")
+        candles: list[dict[str, float]] = []
+        for row in result:
+            candles.append(
+                {
+                    "open_time": float(row[0]),
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                }
+            )
+        return candles
+
     def get_book_ticker(self, symbol: str) -> dict[str, float]:
         result = self._request("GET", "/api/v3/ticker/bookTicker", {"symbol": symbol})
         return {"bid": float(result["bidPrice"]), "ask": float(result["askPrice"])}

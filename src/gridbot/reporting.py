@@ -12,6 +12,9 @@ def build_daily_summary(
     active_symbols: list[str],
     bot_stopped: bool,
     pnl_status_line: str,
+    regime_mode: str = "off",
+    regime_pauses: int = 0,
+    regime_resumes: int = 0,
 ) -> str:
     now = datetime.now(ZoneInfo(timezone_name))
     pnl = store.get_realized_pnl_today()
@@ -22,5 +25,6 @@ def build_daily_summary(
         f"Status: {status}\n"
         f"Active symbols: {joined}\n"
         f"Realized PnL today (USDT): {pnl:.4f}\n"
+        f"Regime filter: {regime_mode} (pauses={regime_pauses}, resumes={regime_resumes})\n"
         f"{pnl_status_line}"
     )

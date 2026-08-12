@@ -22,6 +22,13 @@ from gridbot.reconciliation import (
     reconcile_snapshots,
     save_local_snapshot,
 )
+from gridbot.regime import (
+    REGIME_RANGING,
+    REGIME_TRENDING,
+    InsufficientDataError,
+    RegimeThresholds,
+    classify_regime,
+)
 from gridbot.reporting import build_daily_summary
 from gridbot.risk_guard import check_daily_loss_limit, check_symbol_band
 from gridbot.selector import select_symbols
@@ -354,6 +361,108 @@ def _load_reconciliation_gate_state(
     return clean_cycles, resume_block_active
 
 
+class RegimeController:
+    """Per-symbol ranging-vs-trending regime filter.
+
+    Modes:
+      - off: disabled, no-op.
+      - shadow: computes and logs verdicts but never acts on trading.
+      - active: trending verdict blocks entry / pauses & flattens; ranging
+        verdict auto-resumes.
+    """
+
+    def __init__(
+        self,
+        cfg: BotConfig,
+        exchange: BinanceSpotClient,
+        store: StateStore,
+        alerter: TelegramAlerter,
+    ) -> None:
+        self._cfg = cfg
+        self._exchange = exchange
+        self._store = store
+        self._alerter = alerter
+        self._thresholds = RegimeThresholds(
+            adx_enter=cfg.regime_adx_enter,
+            adx_exit=cfg.regime_adx_exit,
+            hurst_enter=cfg.regime_hurst_enter,
+            hurst_exit=cfg.regime_hurst_exit,
+            min_vol_pct=cfg.regime_min_vol_pct,
+            max_vol_pct=cfg.regime_max_vol_pct,
+        )
+        self._state: dict[str, dict[str, object]] = {}
+        self.pauses_today = 0
+        self.resumes_today = 0
+        self._counter_day: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._cfg.regime_filter_mode in {"shadow", "active"}
+
+    @property
+    def active(self) -> bool:
+        return self._cfg.regime_filter_mode == "active"
+
+    def roll_day(self, day_key: str) -> None:
+        if day_key != self._counter_day:
+            self._counter_day = day_key
+            self.pauses_today = 0
+            self.resumes_today = 0
+
+    def last_verdict(self, symbol: str) -> str | None:
+        entry = self._state.get(symbol)
+        return str(entry["verdict"]) if entry else None
+
+    def _is_due(self, symbol: str, now: datetime) -> bool:
+        entry = self._state.get(symbol)
+        if entry is None:
+            return True
+        last_ts = entry["last_ts"]
+        assert isinstance(last_ts, datetime)
+        return (now - last_ts).total_seconds() >= self._cfg.regime_recompute_seconds
+
+    def refresh(self, symbol: str, now: datetime, force: bool = False) -> None:
+        """Recompute the regime verdict for a symbol if due (or forced).
+
+        Fails open: on data/API errors the cached verdict is left unchanged and
+        no trading action is taken."""
+        if not self.enabled:
+            return
+        if not force and not self._is_due(symbol, now):
+            return
+        try:
+            candles = self._exchange.get_klines(
+                symbol,
+                self._cfg.regime_kline_interval,
+                self._cfg.regime_kline_lookback,
+            )
+            assessment = classify_regime(candles, self._thresholds, self.last_verdict(symbol))
+        except (InsufficientDataError, requests.RequestException, ValueError, KeyError) as error:
+            logging.warning("Regime assessment failed for %s: %s", symbol, error)
+            return
+        self._state[symbol] = {"verdict": assessment.verdict, "last_ts": now}
+        self._store.log_risk_event(
+            "regime_verdict",
+            symbol,
+            {
+                "mode": self._cfg.regime_filter_mode,
+                "verdict": assessment.verdict,
+                "adx": round(assessment.metrics.adx, 3),
+                "hurst": round(assessment.metrics.hurst, 4),
+                "vol_pct": round(assessment.metrics.realized_vol_pct, 4),
+                "reason": assessment.reason,
+            },
+        )
+
+    def note_pause(self, symbol: str) -> None:
+        self.pauses_today += 1
+        self._alerter.send(f"GridBot regime: {symbol} paused (trending regime).")
+
+    def note_resume(self, symbol: str) -> None:
+        self.resumes_today += 1
+        self._alerter.send(f"GridBot regime: {symbol} resumed (ranging regime).")
+
+
 def run() -> None:
     _setup_logging()
     cfg = load_config()
@@ -365,6 +474,8 @@ def run() -> None:
     pnl_provider = _make_pnl_provider(cfg, exchange, store)
     cancel_all_provider = _make_cancel_all_provider(cfg, exchange)
     start_fresh_provider = _make_start_fresh_provider(cfg, exchange, store)
+    regime = RegimeController(cfg, exchange, store, alerter)
+    logging.info("Regime filter mode=%s", cfg.regime_filter_mode)
 
     blacklist = _load_blacklist(cfg.blacklist_path)
     tz = ZoneInfo(cfg.timezone_name)
@@ -416,6 +527,8 @@ def run() -> None:
             if now >= next_symbol_refresh:
                 active_symbols = _refresh_symbols(cfg, exchange, blacklist, alerter)
                 next_symbol_refresh = now + timedelta(minutes=cfg.symbol_refresh_minutes)
+
+            regime.roll_day(store.get_day_key())
 
             risk = check_daily_loss_limit(store, cfg.capital_usdt, cfg.daily_loss_limit_pct)
             if risk.should_stop and not bot_halted:
@@ -517,6 +630,22 @@ def run() -> None:
                 state = store.get_symbol_state(symbol)
 
                 if state is None:
+                    regime.refresh(symbol, now, force=True)
+                    if regime.active and regime.last_verdict(symbol) == REGIME_TRENDING:
+                        plan = build_grid(
+                            symbol, price, cfg.grid_spacing_pct, cfg.grid_levels, cfg.per_symbol_capital
+                        )
+                        store.upsert_symbol_state(
+                            symbol,
+                            center_price=plan.center_price,
+                            lower_bound=plan.lower_bound,
+                            upper_bound=plan.upper_bound,
+                            paused=True,
+                            pause_reason="trend_regime",
+                        )
+                        store.log_risk_event("regime_block_entry", symbol, {"price": price})
+                        regime.note_pause(symbol)
+                        continue
                     plan = build_grid(symbol, price, cfg.grid_spacing_pct, cfg.grid_levels, cfg.per_symbol_capital)
                     store.upsert_symbol_state(
                         symbol,
@@ -535,6 +664,31 @@ def run() -> None:
                     continue
 
                 if state.paused:
+                    if state.pause_reason == "trend_regime":
+                        regime.refresh(symbol, now)
+                        if regime.active and regime.last_verdict(symbol) == REGIME_RANGING:
+                            recentered = build_grid(
+                                symbol, price, cfg.grid_spacing_pct, cfg.grid_levels, cfg.per_symbol_capital
+                            )
+                            store.upsert_symbol_state(
+                                symbol,
+                                center_price=recentered.center_price,
+                                lower_bound=recentered.lower_bound,
+                                upper_bound=recentered.upper_bound,
+                                paused=False,
+                                pause_reason=None,
+                            )
+                            store.log_risk_event("regime_resume", symbol, {"price": price})
+                            regime.note_resume(symbol)
+                            try:
+                                sync_grid_orders(
+                                    exchange, store, recentered, ExecutionConfig(dry_run=cfg.dry_run)
+                                )
+                            except InsufficientFundsError as error:
+                                _handle_insufficient_funds(store, alerter, symbol, error)
+                            except OrderPlacementError as error:
+                                _handle_order_placement_error(store, alerter, symbol, error)
+                        continue
                     if (
                         state.pause_reason == "insufficient_funds"
                         and _should_retry_insufficient_funds(
@@ -554,6 +708,26 @@ def run() -> None:
                             continue
                     else:
                         continue
+
+                regime.refresh(symbol, now)
+                if regime.active and regime.last_verdict(symbol) == REGIME_TRENDING:
+                    store.set_symbol_paused(symbol, True, "trend_regime")
+                    if not cfg.dry_run:
+                        try:
+                            exchange.cancel_all_orders(symbol)
+                        except requests.HTTPError as error:
+                            details = extract_binance_error_detail(error)
+                            store.log_risk_event(
+                                "cancel_all_orders_error",
+                                symbol,
+                                {"context": "trend_regime", "details": details},
+                            )
+                            alerter.send(
+                                f"Cancel all failed while pausing {symbol} for trend_regime: {details}"
+                            )
+                    store.log_risk_event("regime_pause", symbol, {"price": price})
+                    regime.note_pause(symbol)
+                    continue
 
                 band_trigger = check_symbol_band(
                     center_price=state.center_price,
@@ -633,7 +807,16 @@ def run() -> None:
                 except (requests.RequestException, ValueError) as error:
                     logging.warning("P/L snapshot failed for daily report: %s", error)
                     pnl_status_line = "P/L update unavailable (snapshot error)."
-                summary = build_daily_summary(store, cfg.timezone_name, active_symbols, bot_halted, pnl_status_line)
+                summary = build_daily_summary(
+                    store,
+                    cfg.timezone_name,
+                    active_symbols,
+                    bot_halted,
+                    pnl_status_line,
+                    regime_mode=cfg.regime_filter_mode,
+                    regime_pauses=regime.pauses_today,
+                    regime_resumes=regime.resumes_today,
+                )
                 alerter.send(summary)
                 store.set_state("last_report_day", day_key)
                 last_report_day = day_key

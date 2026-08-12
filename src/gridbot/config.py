@@ -66,6 +66,16 @@ class BotConfig:
     reconciliation_check_on_halt: bool
     max_active_symbols: int
     max_symbol_capital_pct: float
+    regime_filter_mode: str
+    regime_adx_enter: float
+    regime_adx_exit: float
+    regime_hurst_enter: float
+    regime_hurst_exit: float
+    regime_min_vol_pct: float
+    regime_max_vol_pct: float
+    regime_recompute_seconds: int
+    regime_kline_interval: str
+    regime_kline_lookback: int
     binance_base_url: str
     timezone_name: str
     db_path: Path
@@ -112,6 +122,29 @@ def load_config() -> BotConfig:
     if reconciliation_clean_cycles_required < 1:
         raise ValueError("RECONCILIATION_CLEAN_CYCLES_REQUIRED must be >= 1")
 
+    regime_filter_mode = _get_env("REGIME_FILTER_MODE", "shadow").strip().lower()
+    if regime_filter_mode not in {"off", "shadow", "active"}:
+        raise ValueError("REGIME_FILTER_MODE must be one of: off, shadow, active")
+    regime_adx_enter = float(_get_env("REGIME_ADX_ENTER", "25"))
+    regime_adx_exit = float(_get_env("REGIME_ADX_EXIT", "18"))
+    if regime_adx_exit >= regime_adx_enter:
+        raise ValueError("REGIME_ADX_EXIT must be < REGIME_ADX_ENTER (hysteresis)")
+    regime_hurst_enter = float(_get_env("REGIME_HURST_ENTER", "0.55"))
+    regime_hurst_exit = float(_get_env("REGIME_HURST_EXIT", "0.50"))
+    if regime_hurst_exit > regime_hurst_enter:
+        raise ValueError("REGIME_HURST_EXIT must be <= REGIME_HURST_ENTER (hysteresis)")
+    regime_min_vol_pct = float(_get_env("REGIME_MIN_VOL_PCT", "0.05"))
+    regime_max_vol_pct = float(_get_env("REGIME_MAX_VOL_PCT", "5.0"))
+    if regime_min_vol_pct < 0 or regime_max_vol_pct <= regime_min_vol_pct:
+        raise ValueError("REGIME_MAX_VOL_PCT must be > REGIME_MIN_VOL_PCT >= 0")
+    regime_recompute_seconds = int(_get_env("REGIME_RECOMPUTE_SECONDS", "300"))
+    if regime_recompute_seconds < 1:
+        raise ValueError("REGIME_RECOMPUTE_SECONDS must be >= 1")
+    regime_kline_interval = _get_env("REGIME_KLINE_INTERVAL", "15m").strip()
+    regime_kline_lookback = int(_get_env("REGIME_KLINE_LOOKBACK", "96"))
+    if regime_kline_lookback < 40:
+        raise ValueError("REGIME_KLINE_LOOKBACK must be >= 40 for stable indicators")
+
     return BotConfig(
         mode=mode,
         api_key=api_key,
@@ -136,6 +169,16 @@ def load_config() -> BotConfig:
         reconciliation_check_on_halt=_get_bool("RECONCILIATION_CHECK_ON_HALT", True),
         max_active_symbols=int(_get_env("MAX_ACTIVE_SYMBOLS", "5")),
         max_symbol_capital_pct=float(_get_env("MAX_SYMBOL_CAPITAL_PCT", "0.20")),
+        regime_filter_mode=regime_filter_mode,
+        regime_adx_enter=regime_adx_enter,
+        regime_adx_exit=regime_adx_exit,
+        regime_hurst_enter=regime_hurst_enter,
+        regime_hurst_exit=regime_hurst_exit,
+        regime_min_vol_pct=regime_min_vol_pct,
+        regime_max_vol_pct=regime_max_vol_pct,
+        regime_recompute_seconds=regime_recompute_seconds,
+        regime_kline_interval=regime_kline_interval,
+        regime_kline_lookback=regime_kline_lookback,
         binance_base_url=base_url,
         timezone_name=_get_env("TIMEZONE", "Asia/Jerusalem"),
         db_path=Path(_get_env("DB_PATH", "data/gridbot.db")),

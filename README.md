@@ -91,7 +91,49 @@ docker compose logs -f gridbot
 3. Go live with tiny position sizing.
 4. Increase capital only after multi-week stability.
 
-## 7) Current v1 scope notes
+## 7) AI regime filter (ranging vs trending)
+
+A per-symbol statistical classifier decides **when** the grid should trade a
+symbol versus pause it. Grid bots bleed money when the market trends against the
+grid, so this filter blocks/pauses grids on symbols that are trending and
+resumes them when they return to a range. It is not a price-direction predictor
+and uses no trained model. See [docs/adr/0001-ai-regime-filter.md](docs/adr/0001-ai-regime-filter.md)
+and [docs/glossary.md](docs/glossary.md) for the full design and vocabulary.
+
+How it works:
+
+- Fetches 15m klines (~96 bars) for the shortlisted and currently-active symbols
+  only (a handful of extra API calls per cycle).
+- Computes **ADX** (trend strength), the **Hurst exponent** (mean-reverting vs
+  trending), and **realized volatility** (a sanity band), all in pure Python.
+- Verdict uses hysteresis: pause when `ADX > REGIME_ADX_ENTER` and
+  `Hurst > REGIME_HURST_ENTER`; resume when `ADX < REGIME_ADX_EXIT` and
+  `Hurst < REGIME_HURST_EXIT`. The gap between enter/exit prevents flapping.
+- Recomputed every `REGIME_RECOMPUTE_SECONDS` and on each symbol refresh.
+
+Modes (`REGIME_FILTER_MODE`):
+
+- `off` - disabled.
+- `shadow` (default) - computes and logs `regime_verdict` events (visible via
+  `/transitions`) but does **not** affect trading. Run this first to gather
+  evidence before activating.
+- `active` - a trending verdict blocks new entries and pauses & flattens an
+  existing grid (`pause_reason=trend_regime`); a ranging verdict auto-resumes and
+  rebuilds the grid at the current price. Flips send a deduplicated Telegram
+  alert, and the daily summary reports pause/resume counts.
+
+Tune the thresholds in `.env`: `REGIME_FILTER_MODE`, `REGIME_ADX_ENTER`,
+`REGIME_ADX_EXIT`, `REGIME_HURST_ENTER`, `REGIME_HURST_EXIT`,
+`REGIME_MIN_VOL_PCT`, `REGIME_MAX_VOL_PCT`, `REGIME_RECOMPUTE_SECONDS`,
+`REGIME_KLINE_INTERVAL`, `REGIME_KLINE_LOOKBACK`.
+
+Run the regime unit tests with:
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests
+```
+
+## 8) Current v1 scope notes
 
 - Order placement is implemented with maker-first grid orders.
 - Insufficient-funds order failures are handled gracefully: the symbol is paused silently and a risk event is recorded (no Telegram alert).
@@ -100,7 +142,7 @@ docker compose logs -f gridbot
 - The fallback from stale maker orders to taker orders should be added next as a latency- and slippage-aware policy.
 - Fill-by-fill realized PnL tracking is not wired yet; daily report field "Realized PnL today" remains 0 unless explicitly recorded.
 
-## 8) Safety reconciliation behavior
+## 9) Safety reconciliation behavior
 
 - In `testnet/live`, the bot can run reconciliation checks against exchange balances/equity.
 - If drift exceeds thresholds, the bot performs a global halt and records a `reconciliation_breach` risk event.
