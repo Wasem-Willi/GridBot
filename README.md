@@ -133,6 +133,37 @@ Run the regime unit tests with:
 PYTHONPATH=src python -m unittest discover -s tests
 ```
 
+### Optional: Generative AI trading filter (OpenAI)
+
+You can add a live generative AI decision layer that chooses one action per
+symbol:
+
+- `BUY_ONLY` - place only BUY grid levels.
+- `SELL_ONLY` - place only SELL grid levels.
+- `BOTH` - keep normal grid behavior.
+- `PAUSE` - pause symbol and cancel open orders.
+
+Modes (`AI_FILTER_MODE`):
+
+- `off` - disabled.
+- `shadow` (recommended first) - logs `ai_decision` events only, no action.
+- `active` - applies AI actions in the live loop.
+
+Safety behavior:
+
+- Fail-safe by default: if OpenAI times out/errors/returns invalid JSON, bot
+  logs a warning and continues deterministic flow.
+- Existing risk and reconciliation guards still apply.
+
+Env keys:
+
+- `AI_FILTER_MODE` = `off|shadow|active`
+- `AI_PROVIDER` = `openai`
+- `AI_MODEL` (for example `gpt-4o-mini`)
+- `OPENAI_API_KEY`
+- `AI_TIMEOUT_SECONDS` (default `2`)
+- `AI_RECOMPUTE_SECONDS` (default `300`)
+
 ## 8) Current v1 scope notes
 
 - Order placement is implemented with maker-first grid orders.

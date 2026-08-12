@@ -10,10 +10,17 @@ from zoneinfo import ZoneInfo
 import requests
 
 from gridbot.alerts import TelegramAlerter
+from gridbot.ai_filter import (
+    AI_ACTION_BOTH,
+    AI_ACTION_BUY_ONLY,
+    AI_ACTION_PAUSE,
+    AI_ACTION_SELL_ONLY,
+    OpenAIDecisionClient,
+)
 from gridbot.config import BotConfig, load_config
 from gridbot.exchange import BinanceSpotClient, extract_binance_error_detail
 from gridbot.execution import ExecutionConfig, InsufficientFundsError, OrderPlacementError, sync_grid_orders
-from gridbot.grid_engine import build_grid, is_outside_grid
+from gridbot.grid_engine import GridLevel, GridPlan, build_grid, is_outside_grid
 from gridbot.pnl import compute_live_pnl_snapshot
 from gridbot.reconciliation import (
     ReconciliationResult,
@@ -463,6 +470,106 @@ class RegimeController:
         self._alerter.send(f"GridBot regime: {symbol} resumed (ranging regime).")
 
 
+def _plan_for_ai_action(plan: GridPlan, action: str) -> GridPlan:
+    if action == AI_ACTION_BOTH:
+        return plan
+    if action == AI_ACTION_BUY_ONLY:
+        levels = [level for level in plan.levels if level.side == "BUY"]
+    elif action == AI_ACTION_SELL_ONLY:
+        levels = [level for level in plan.levels if level.side == "SELL"]
+    else:
+        levels = []
+    if not levels:
+        return plan
+    return GridPlan(
+        symbol=plan.symbol,
+        center_price=plan.center_price,
+        lower_bound=plan.lower_bound,
+        upper_bound=plan.upper_bound,
+        levels=[GridLevel(side=level.side, price=level.price, quantity=level.quantity) for level in levels],
+    )
+
+
+class AIFilterController:
+    def __init__(
+        self,
+        cfg: BotConfig,
+        store: StateStore,
+        alerter: TelegramAlerter,
+    ) -> None:
+        self._cfg = cfg
+        self._store = store
+        self._alerter = alerter
+        self._client = OpenAIDecisionClient(cfg.ai_api_key, cfg.ai_model, cfg.ai_timeout_seconds)
+        self._state: dict[str, dict[str, object]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return self._cfg.ai_filter_mode in {"shadow", "active"}
+
+    @property
+    def active(self) -> bool:
+        return self._cfg.ai_filter_mode == "active"
+
+    def _is_due(self, symbol: str, now: datetime) -> bool:
+        entry = self._state.get(symbol)
+        if entry is None:
+            return True
+        last_ts = entry["last_ts"]
+        assert isinstance(last_ts, datetime)
+        return (now - last_ts).total_seconds() >= self._cfg.ai_recompute_seconds
+
+    def last_action(self, symbol: str) -> str:
+        entry = self._state.get(symbol)
+        if entry is None:
+            return AI_ACTION_BOTH
+        return str(entry["action"])
+
+    def refresh(
+        self,
+        symbol: str,
+        now: datetime,
+        *,
+        price: float,
+        current_position_paused: bool,
+        regime_verdict: str | None,
+        force: bool = False,
+    ) -> None:
+        if not self.enabled:
+            return
+        if not force and not self._is_due(symbol, now):
+            return
+        payload = {
+            "symbol": symbol,
+            "price": round(price, 8),
+            "regime_verdict": regime_verdict or "unknown",
+            "symbol_is_paused": current_position_paused,
+            "instructions": "Choose one action: BUY_ONLY, SELL_ONLY, BOTH, or PAUSE.",
+        }
+        try:
+            decision = self._client.decide(payload)
+        except (requests.RequestException, ValueError) as error:
+            logging.warning("AI decision failed for %s: %s", symbol, error)
+            return
+        previous = self.last_action(symbol)
+        self._state[symbol] = {"action": decision.action, "last_ts": now}
+        self._store.log_risk_event(
+            "ai_decision",
+            symbol,
+            {
+                "mode": self._cfg.ai_filter_mode,
+                "action": decision.action,
+                "confidence": round(decision.confidence, 4),
+                "reason": decision.reason,
+            },
+        )
+        if self.active and previous != decision.action:
+            self._alerter.send(
+                f"GridBot AI: {symbol} action {previous} -> {decision.action} "
+                f"(confidence={decision.confidence:.2f})"
+            )
+
+
 def run() -> None:
     _setup_logging()
     cfg = load_config()
@@ -475,7 +582,9 @@ def run() -> None:
     cancel_all_provider = _make_cancel_all_provider(cfg, exchange)
     start_fresh_provider = _make_start_fresh_provider(cfg, exchange, store)
     regime = RegimeController(cfg, exchange, store, alerter)
+    ai_filter = AIFilterController(cfg, store, alerter)
     logging.info("Regime filter mode=%s", cfg.regime_filter_mode)
+    logging.info("AI filter mode=%s model=%s", cfg.ai_filter_mode, cfg.ai_model)
 
     blacklist = _load_blacklist(cfg.blacklist_path)
     tz = ZoneInfo(cfg.timezone_name)
@@ -647,6 +756,27 @@ def run() -> None:
                         regime.note_pause(symbol)
                         continue
                     plan = build_grid(symbol, price, cfg.grid_spacing_pct, cfg.grid_levels, cfg.per_symbol_capital)
+                    ai_filter.refresh(
+                        symbol,
+                        now,
+                        price=price,
+                        current_position_paused=False,
+                        regime_verdict=regime.last_verdict(symbol),
+                        force=True,
+                    )
+                    ai_action = ai_filter.last_action(symbol)
+                    if ai_filter.active and ai_action == AI_ACTION_PAUSE:
+                        store.upsert_symbol_state(
+                            symbol,
+                            center_price=plan.center_price,
+                            lower_bound=plan.lower_bound,
+                            upper_bound=plan.upper_bound,
+                            paused=True,
+                            pause_reason="ai_pause",
+                        )
+                        store.log_risk_event("ai_pause", symbol, {"price": price})
+                        continue
+                    effective_plan = _plan_for_ai_action(plan, ai_action if ai_filter.active else AI_ACTION_BOTH)
                     store.upsert_symbol_state(
                         symbol,
                         center_price=plan.center_price,
@@ -656,7 +786,7 @@ def run() -> None:
                         pause_reason=None,
                     )
                     try:
-                        sync_grid_orders(exchange, store, plan, ExecutionConfig(dry_run=cfg.dry_run))
+                        sync_grid_orders(exchange, store, effective_plan, ExecutionConfig(dry_run=cfg.dry_run))
                     except InsufficientFundsError as error:
                         _handle_insufficient_funds(store, alerter, symbol, error)
                     except OrderPlacementError as error:
@@ -689,6 +819,21 @@ def run() -> None:
                             except OrderPlacementError as error:
                                 _handle_order_placement_error(store, alerter, symbol, error)
                         continue
+                    if state.pause_reason == "ai_pause":
+                        ai_filter.refresh(
+                            symbol,
+                            now,
+                            price=price,
+                            current_position_paused=True,
+                            regime_verdict=regime.last_verdict(symbol),
+                        )
+                        if ai_filter.active and ai_filter.last_action(symbol) != AI_ACTION_PAUSE:
+                            store.set_symbol_paused(symbol, False, None)
+                            state = store.get_symbol_state(symbol)
+                            if state is None:
+                                continue
+                        else:
+                            continue
                     if (
                         state.pause_reason == "insufficient_funds"
                         and _should_retry_insufficient_funds(
@@ -727,6 +872,29 @@ def run() -> None:
                             )
                     store.log_risk_event("regime_pause", symbol, {"price": price})
                     regime.note_pause(symbol)
+                    continue
+                ai_filter.refresh(
+                    symbol,
+                    now,
+                    price=price,
+                    current_position_paused=False,
+                    regime_verdict=regime.last_verdict(symbol),
+                )
+                ai_action = ai_filter.last_action(symbol)
+                if ai_filter.active and ai_action == AI_ACTION_PAUSE:
+                    store.set_symbol_paused(symbol, True, "ai_pause")
+                    if not cfg.dry_run:
+                        try:
+                            exchange.cancel_all_orders(symbol)
+                        except requests.HTTPError as error:
+                            details = extract_binance_error_detail(error)
+                            store.log_risk_event(
+                                "cancel_all_orders_error",
+                                symbol,
+                                {"context": "ai_pause", "details": details},
+                            )
+                            alerter.send(f"Cancel all failed while pausing {symbol} for ai_pause: {details}")
+                    store.log_risk_event("ai_pause", symbol, {"price": price})
                     continue
 
                 band_trigger = check_symbol_band(
@@ -775,6 +943,10 @@ def run() -> None:
                             )
                             continue
                     recentered = build_grid(symbol, price, cfg.grid_spacing_pct, cfg.grid_levels, cfg.per_symbol_capital)
+                    effective_recentered = _plan_for_ai_action(
+                        recentered,
+                        ai_action if ai_filter.active else AI_ACTION_BOTH,
+                    )
                     store.upsert_symbol_state(
                         symbol,
                         center_price=recentered.center_price,
@@ -784,14 +956,18 @@ def run() -> None:
                         pause_reason=None,
                     )
                     try:
-                        sync_grid_orders(exchange, store, recentered, ExecutionConfig(dry_run=cfg.dry_run))
+                        sync_grid_orders(exchange, store, effective_recentered, ExecutionConfig(dry_run=cfg.dry_run))
                     except InsufficientFundsError as error:
                         _handle_insufficient_funds(store, alerter, symbol, error)
                     except OrderPlacementError as error:
                         _handle_order_placement_error(store, alerter, symbol, error)
                 else:
+                    effective_current_plan = _plan_for_ai_action(
+                        current_plan,
+                        ai_action if ai_filter.active else AI_ACTION_BOTH,
+                    )
                     try:
-                        sync_grid_orders(exchange, store, current_plan, ExecutionConfig(dry_run=cfg.dry_run))
+                        sync_grid_orders(exchange, store, effective_current_plan, ExecutionConfig(dry_run=cfg.dry_run))
                     except InsufficientFundsError as error:
                         _handle_insufficient_funds(store, alerter, symbol, error)
                     except OrderPlacementError as error:

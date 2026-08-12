@@ -76,6 +76,12 @@ class BotConfig:
     regime_recompute_seconds: int
     regime_kline_interval: str
     regime_kline_lookback: int
+    ai_filter_mode: str
+    ai_provider: str
+    ai_model: str
+    ai_api_key: str
+    ai_timeout_seconds: int
+    ai_recompute_seconds: int
     binance_base_url: str
     timezone_name: str
     db_path: Path
@@ -144,6 +150,22 @@ def load_config() -> BotConfig:
     regime_kline_lookback = int(_get_env("REGIME_KLINE_LOOKBACK", "96"))
     if regime_kline_lookback < 40:
         raise ValueError("REGIME_KLINE_LOOKBACK must be >= 40 for stable indicators")
+    ai_filter_mode = _get_env("AI_FILTER_MODE", "off").strip().lower()
+    if ai_filter_mode not in {"off", "shadow", "active"}:
+        raise ValueError("AI_FILTER_MODE must be one of: off, shadow, active")
+    ai_provider = _get_env("AI_PROVIDER", "openai").strip().lower()
+    if ai_provider != "openai":
+        raise ValueError("AI_PROVIDER must be openai")
+    ai_model = _get_env("AI_MODEL", "gpt-4o-mini").strip()
+    ai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if ai_filter_mode != "off" and not ai_api_key:
+        raise ValueError("OPENAI_API_KEY is required when AI_FILTER_MODE is shadow/active")
+    ai_timeout_seconds = int(_get_env("AI_TIMEOUT_SECONDS", "2"))
+    if ai_timeout_seconds < 1:
+        raise ValueError("AI_TIMEOUT_SECONDS must be >= 1")
+    ai_recompute_seconds = int(_get_env("AI_RECOMPUTE_SECONDS", "300"))
+    if ai_recompute_seconds < 1:
+        raise ValueError("AI_RECOMPUTE_SECONDS must be >= 1")
 
     return BotConfig(
         mode=mode,
@@ -179,6 +201,12 @@ def load_config() -> BotConfig:
         regime_recompute_seconds=regime_recompute_seconds,
         regime_kline_interval=regime_kline_interval,
         regime_kline_lookback=regime_kline_lookback,
+        ai_filter_mode=ai_filter_mode,
+        ai_provider=ai_provider,
+        ai_model=ai_model,
+        ai_api_key=ai_api_key,
+        ai_timeout_seconds=ai_timeout_seconds,
+        ai_recompute_seconds=ai_recompute_seconds,
         binance_base_url=base_url,
         timezone_name=_get_env("TIMEZONE", "Asia/Jerusalem"),
         db_path=Path(_get_env("DB_PATH", "data/gridbot.db")),
