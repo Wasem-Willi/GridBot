@@ -8,7 +8,7 @@ import requests
 
 from gridbot.exchange import BinanceSpotClient
 from gridbot.exchange import extract_binance_error_detail, is_insufficient_balance_error
-from gridbot.grid_engine import GridPlan
+from gridbot.grid_engine import GridLevel, GridPlan
 from gridbot.state_store import StateStore
 
 
@@ -60,17 +60,6 @@ def sync_grid_orders(
         if is_insufficient_balance_error(error):
             raise InsufficientFundsError(plan.symbol, details) from error
         raise OrderPlacementError(plan.symbol, details) from error
-    if open_orders:
-        for order in open_orders:
-            order_id = int(order["orderId"])
-            try:
-                exchange.cancel_order(plan.symbol, order_id)
-            except requests.HTTPError as error:
-                details = extract_binance_error_detail(error)
-                if is_insufficient_balance_error(error):
-                    raise InsufficientFundsError(plan.symbol, details) from error
-                raise OrderPlacementError(plan.symbol, details) from error
-            store.write_order(str(order_id), plan.symbol, order["side"], float(order["price"]), float(order["origQty"]), "CANCELED")
 
     try:
         base_asset, quote_asset = exchange.get_symbol_assets(plan.symbol)
@@ -85,28 +74,66 @@ def sync_grid_orders(
     except ValueError as error:
         raise OrderPlacementError(plan.symbol, str(error)) from error
 
-    placed_orders = 0
+    # Normalize desired levels up front so they can be matched against orders
+    # already resting on the book, instead of blindly cancelling and
+    # re-placing everything every cycle.
+    desired_levels: list[tuple[str, Decimal, Decimal, GridLevel]] = []
     skipped_levels = 0
-    balance_skipped_levels = 0
     for level in plan.levels:
         normalized = exchange.normalize_limit_order(plan.symbol, level.price, level.quantity)
         if normalized is None:
             skipped_levels += 1
             continue
         normalized_price, normalized_quantity = normalized
-        price_dec = Decimal(str(normalized_price))
-        quantity_dec = Decimal(str(normalized_quantity))
-        if level.side == "BUY":
+        desired_levels.append(
+            (level.side, Decimal(str(normalized_price)), Decimal(str(normalized_quantity)), level)
+        )
+
+    existing_by_key: dict[tuple[str, Decimal], dict[str, Any]] = {}
+    for order in open_orders:
+        key = (str(order["side"]), Decimal(str(order["price"])))
+        existing_by_key.setdefault(key, order)
+
+    kept_order_ids: set[int] = set()
+    levels_to_place: list[tuple[str, Decimal, Decimal, GridLevel]] = []
+    for side, price_dec, quantity_dec, level in desired_levels:
+        existing = existing_by_key.get((side, price_dec))
+        if existing is not None:
+            kept_order_ids.add(int(existing["orderId"]))
+            continue
+        levels_to_place.append((side, price_dec, quantity_dec, level))
+
+    # Cancel only orders that are no longer part of the desired grid (e.g.
+    # the AI/regime filter dropped a side, or spacing changed).
+    for order in open_orders:
+        order_id = int(order["orderId"])
+        if order_id in kept_order_ids:
+            continue
+        try:
+            exchange.cancel_order(plan.symbol, order_id)
+        except requests.HTTPError as error:
+            details = extract_binance_error_detail(error)
+            if is_insufficient_balance_error(error):
+                raise InsufficientFundsError(plan.symbol, details) from error
+            raise OrderPlacementError(plan.symbol, details) from error
+        store.write_order(str(order_id), plan.symbol, order["side"], float(order["price"]), float(order["origQty"]), "CANCELED")
+
+    placed_orders = 0
+    balance_skipped_levels = 0
+    for side, price_dec, quantity_dec, level in levels_to_place:
+        if side == "BUY":
             required_quote = price_dec * quantity_dec
             if required_quote > remaining_quote:
                 balance_skipped_levels += 1
                 continue
-        elif level.side == "SELL":
+        elif side == "SELL":
             if quantity_dec > remaining_base:
                 balance_skipped_levels += 1
                 continue
+        normalized_price = float(price_dec)
+        normalized_quantity = float(quantity_dec)
         try:
-            order = exchange.place_limit_order(plan.symbol, level.side, normalized_quantity, normalized_price, post_only=True)
+            order = exchange.place_limit_order(plan.symbol, side, normalized_quantity, normalized_price, post_only=True)
         except requests.HTTPError as error:
             details = extract_binance_error_detail(error)
             if is_insufficient_balance_error(error):
@@ -119,18 +146,19 @@ def sync_grid_orders(
         store.write_order(
             str(order["orderId"]),
             plan.symbol,
-            level.side,
+            side,
             order_price,
             order_qty,
             order_status,
         )
         placed_orders += 1
-        if level.side == "BUY":
+        if side == "BUY":
             remaining_quote -= price_dec * quantity_dec
-        elif level.side == "SELL":
+        elif side == "SELL":
             remaining_base -= quantity_dec
 
-    if placed_orders == 0:
+    active_orders = len(kept_order_ids) + placed_orders
+    if active_orders == 0:
         if balance_skipped_levels > 0:
             raise InsufficientFundsError(
                 plan.symbol,
