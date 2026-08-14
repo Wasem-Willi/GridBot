@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any
 
 import requests
 
@@ -27,6 +29,16 @@ class OrderPlacementError(Exception):
         super().__init__(f"Order placement failed for {symbol}: {details}")
         self.symbol = symbol
         self.details = details
+
+
+def _free_balance(account: dict[str, Any], asset: str) -> Decimal:
+    balances = account.get("balances")
+    if not isinstance(balances, list):
+        raise ValueError("Account response does not contain a balances list")
+    for balance in balances:
+        if isinstance(balance, dict) and balance.get("asset") == asset:
+            return Decimal(str(balance.get("free", "0")))
+    return Decimal("0")
 
 
 def sync_grid_orders(
@@ -60,14 +72,39 @@ def sync_grid_orders(
                 raise OrderPlacementError(plan.symbol, details) from error
             store.write_order(str(order_id), plan.symbol, order["side"], float(order["price"]), float(order["origQty"]), "CANCELED")
 
+    try:
+        base_asset, quote_asset = exchange.get_symbol_assets(plan.symbol)
+        account = exchange.get_account()
+        remaining_base = _free_balance(account, base_asset)
+        remaining_quote = _free_balance(account, quote_asset)
+    except requests.HTTPError as error:
+        details = extract_binance_error_detail(error)
+        if is_insufficient_balance_error(error):
+            raise InsufficientFundsError(plan.symbol, details) from error
+        raise OrderPlacementError(plan.symbol, details) from error
+    except ValueError as error:
+        raise OrderPlacementError(plan.symbol, str(error)) from error
+
     placed_orders = 0
     skipped_levels = 0
+    balance_skipped_levels = 0
     for level in plan.levels:
         normalized = exchange.normalize_limit_order(plan.symbol, level.price, level.quantity)
         if normalized is None:
             skipped_levels += 1
             continue
         normalized_price, normalized_quantity = normalized
+        price_dec = Decimal(str(normalized_price))
+        quantity_dec = Decimal(str(normalized_quantity))
+        if level.side == "BUY":
+            required_quote = price_dec * quantity_dec
+            if required_quote > remaining_quote:
+                balance_skipped_levels += 1
+                continue
+        elif level.side == "SELL":
+            if quantity_dec > remaining_base:
+                balance_skipped_levels += 1
+                continue
         try:
             order = exchange.place_limit_order(plan.symbol, level.side, normalized_quantity, normalized_price, post_only=True)
         except requests.HTTPError as error:
@@ -88,9 +125,27 @@ def sync_grid_orders(
             order_status,
         )
         placed_orders += 1
+        if level.side == "BUY":
+            remaining_quote -= price_dec * quantity_dec
+        elif level.side == "SELL":
+            remaining_base -= quantity_dec
 
     if placed_orders == 0:
+        if balance_skipped_levels > 0:
+            raise InsufficientFundsError(
+                plan.symbol,
+                f"no affordable levels (free {quote_asset}={remaining_quote}, free {base_asset}={remaining_base})",
+            )
         raise OrderPlacementError(
             plan.symbol,
             f"All grid levels rejected by symbol filters (skipped_levels={skipped_levels})",
+        )
+    if balance_skipped_levels > 0:
+        store.log_risk_event(
+            "grid_levels_skipped_insufficient_balance",
+            plan.symbol,
+            {
+                "skipped_levels": balance_skipped_levels,
+                "placed_orders": placed_orders,
+            },
         )

@@ -46,6 +46,8 @@ class FilterValues:
 
 @dataclass(frozen=True)
 class SymbolTradingRules:
+    base_asset: str
+    quote_asset: str
     price_filter: FilterValues
     lot_size_filter: FilterValues
     min_notional: Decimal | None
@@ -129,6 +131,8 @@ class BinanceSpotClient:
                 min_notional = _parse_decimal(notional_raw.get("minNotional"))
 
             rules[symbol] = SymbolTradingRules(
+                base_asset=str(symbol_info.get("baseAsset", "")),
+                quote_asset=str(symbol_info.get("quoteAsset", "")),
                 price_filter=price_filter,
                 lot_size_filter=lot_filter,
                 min_notional=min_notional,
@@ -136,6 +140,12 @@ class BinanceSpotClient:
 
         self._symbol_rules_cache = rules
         return rules
+
+    def get_symbol_assets(self, symbol: str) -> tuple[str, str]:
+        rules = self._load_symbol_rules().get(symbol)
+        if rules is None or not rules.base_asset or not rules.quote_asset:
+            raise ValueError(f"Trading assets are unavailable for symbol: {symbol}")
+        return rules.base_asset, rules.quote_asset
 
     def normalize_limit_order(self, symbol: str, price: float, quantity: float) -> tuple[float, float] | None:
         rules = self._load_symbol_rules().get(symbol)

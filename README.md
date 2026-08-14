@@ -168,7 +168,8 @@ Env keys:
 ## 8) Current v1 scope notes
 
 - Order placement is implemented with maker-first grid orders.
-- Insufficient-funds order failures are handled gracefully: the symbol is paused silently and a risk event is recorded (no Telegram alert).
+- Grid levels are checked against free wallet balances before placement. A USDT-only wallet can place affordable BUY levels; SELL levels are added only when free base-asset inventory exists.
+- If no grid level is affordable, the symbol is paused and an insufficient-funds risk event records the available-balance details.
 - Non-insufficient order placement failures are handled gracefully too: the symbol is paused and alert details are sent to Telegram.
 - Account-equity P/L snapshots are available in `testnet/live` modes via `/pnl` and included in `/status`.
 - The fallback from stale maker orders to taker orders should be added next as a latency- and slippage-aware policy.

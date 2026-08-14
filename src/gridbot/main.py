@@ -144,10 +144,14 @@ def _handle_insufficient_funds(
     store: StateStore,
     _alerter: TelegramAlerter,
     symbol: str,
-    _error: InsufficientFundsError,
+    error: InsufficientFundsError,
 ) -> None:
     store.set_symbol_paused(symbol, True, "insufficient_funds")
-    store.log_risk_event("insufficient_funds", symbol, {"reason": "insufficient_funds"})
+    store.log_risk_event(
+        "insufficient_funds",
+        symbol,
+        {"reason": "insufficient_funds", "details": error.details},
+    )
 
 
 def _handle_order_placement_error(
