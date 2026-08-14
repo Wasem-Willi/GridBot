@@ -578,6 +578,28 @@ class AIFilterController:
             )
 
 
+def _plan_for_regime_resume(
+    ai_filter: AIFilterController,
+    plan: GridPlan,
+    symbol: str,
+    now: datetime,
+    price: float,
+    regime_verdict: str | None,
+) -> GridPlan | None:
+    ai_filter.refresh(
+        symbol,
+        now,
+        price=price,
+        current_position_paused=True,
+        regime_verdict=regime_verdict,
+        force=True,
+    )
+    ai_action = ai_filter.last_action(symbol)
+    if ai_filter.active and ai_action == AI_ACTION_PAUSE:
+        return None
+    return _plan_for_ai_action(plan, ai_action if ai_filter.active else AI_ACTION_BOTH)
+
+
 def run() -> None:
     _setup_logging()
     cfg = load_config()
@@ -808,6 +830,18 @@ def run() -> None:
                             recentered = build_grid(
                                 symbol, price, cfg.grid_spacing_pct, cfg.grid_levels, cfg.per_symbol_capital
                             )
+                            effective_recentered = _plan_for_regime_resume(
+                                ai_filter,
+                                recentered,
+                                symbol,
+                                now,
+                                price,
+                                regime.last_verdict(symbol),
+                            )
+                            if effective_recentered is None:
+                                store.set_symbol_paused(symbol, True, "ai_pause")
+                                store.log_risk_event("ai_pause", symbol, {"price": price})
+                                continue
                             store.upsert_symbol_state(
                                 symbol,
                                 center_price=recentered.center_price,
@@ -820,7 +854,10 @@ def run() -> None:
                             regime.note_resume(symbol)
                             try:
                                 sync_grid_orders(
-                                    exchange, store, recentered, ExecutionConfig(dry_run=cfg.dry_run)
+                                    exchange,
+                                    store,
+                                    effective_recentered,
+                                    ExecutionConfig(dry_run=cfg.dry_run),
                                 )
                             except InsufficientFundsError as error:
                                 _handle_insufficient_funds(store, alerter, symbol, error)
