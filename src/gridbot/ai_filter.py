@@ -14,6 +14,39 @@ AI_ACTION_PAUSE = "PAUSE"
 ALLOWED_AI_ACTIONS = {AI_ACTION_BUY_ONLY, AI_ACTION_SELL_ONLY, AI_ACTION_BOTH, AI_ACTION_PAUSE}
 
 
+def _openai_error_message(response: requests.Response) -> str:
+    try:
+        body = response.json()
+    except ValueError:
+        return "unknown error"
+    if not isinstance(body, dict):
+        return "unknown error"
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return "unknown error"
+    message = error.get("message")
+    return str(message).strip() if message else "unknown error"
+
+
+def _response_output_text(result: dict[str, Any]) -> str:
+    output = result.get("output")
+    if not isinstance(output, list):
+        raise ValueError("OpenAI response missing output")
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "output_text":
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                return text
+    raise ValueError("OpenAI response output text missing")
+
+
 @dataclass(frozen=True)
 class AIDecision:
     action: str
@@ -27,7 +60,7 @@ class OpenAIDecisionClient:
         self._model = model
         self._timeout_seconds = timeout_seconds
         self._system_prompt = system_prompt
-        self._endpoint = "https://api.openai.com/v1/chat/completions"
+        self._endpoint = "https://api.openai.com/v1/responses"
 
     def decide(self, payload: dict[str, Any]) -> AIDecision:
         headers = {
@@ -36,15 +69,32 @@ class OpenAIDecisionClient:
         }
         body = {
             "model": self._model,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {
-                    "role": "system",
-                    "content": self._system_prompt,
+            "instructions": self._system_prompt,
+            "input": json.dumps(payload, separators=(",", ":")),
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "gridbot_decision",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": sorted(ALLOWED_AI_ACTIONS),
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1,
+                            },
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["action", "confidence", "reason"],
+                        "additionalProperties": False,
+                    },
                 },
-                {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
-            ],
+            },
         }
         response = requests.post(
             self._endpoint,
@@ -52,15 +102,17 @@ class OpenAIDecisionClient:
             json=body,
             timeout=self._timeout_seconds,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as error:
+            raise ValueError(
+                f"OpenAI request failed (status={response.status_code}): "
+                f"{_openai_error_message(response)}"
+            ) from error
         result = response.json()
-        choices = result.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise ValueError("OpenAI response missing choices")
-        message = choices[0].get("message", {})
-        content = message.get("content")
-        if not isinstance(content, str):
-            raise ValueError("OpenAI response content missing")
+        if not isinstance(result, dict):
+            raise ValueError("OpenAI response must be an object")
+        content = _response_output_text(result)
         parsed = json.loads(content)
         action = str(parsed.get("action", "")).upper()
         if action not in ALLOWED_AI_ACTIONS:

@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 from gridbot.ai_filter import AI_ACTION_BUY_ONLY, AI_ACTION_PAUSE
 from gridbot.grid_engine import GridLevel, GridPlan
-from gridbot.main import _plan_for_regime_resume
+from gridbot.main import AIFilterController, _plan_for_regime_resume
 from gridbot.regime import REGIME_RANGING
 
 
@@ -24,6 +24,36 @@ def _grid_plan() -> GridPlan:
 
 
 class RegimeResumeCoordinationTests(unittest.TestCase):
+    def test_active_ai_failure_fails_closed(self) -> None:
+        controller = object.__new__(AIFilterController)
+        controller._cfg = Mock(ai_filter_mode="active", ai_recompute_seconds=60)
+        controller._store = Mock()
+        controller._alerter = Mock()
+        controller._client = Mock()
+        controller._client.decide.side_effect = ValueError("invalid model")
+        controller._state = {}
+        now = datetime.now(UTC)
+
+        controller.refresh(
+            "BTCUSDT",
+            now,
+            price=100.0,
+            current_position_paused=False,
+            regime_verdict=REGIME_RANGING,
+            force=True,
+        )
+
+        self.assertEqual(controller.last_action("BTCUSDT"), AI_ACTION_PAUSE)
+        controller._store.log_risk_event.assert_called_once_with(
+            "ai_decision_error",
+            "BTCUSDT",
+            {
+                "mode": "active",
+                "action": AI_ACTION_PAUSE,
+                "details": "invalid model",
+            },
+        )
+
     def test_ai_pause_prevents_regime_resume(self) -> None:
         ai_filter = Mock()
         ai_filter.active = True

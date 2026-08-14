@@ -562,6 +562,18 @@ class AIFilterController:
             decision = self._client.decide(payload)
         except (requests.RequestException, ValueError) as error:
             logging.warning("AI decision failed for %s: %s", symbol, error)
+            fallback_action = AI_ACTION_PAUSE if self.active else self.last_action(symbol)
+            if self.active:
+                self._state[symbol] = {"action": fallback_action, "last_ts": now}
+            self._store.log_risk_event(
+                "ai_decision_error",
+                symbol,
+                {
+                    "mode": self._cfg.ai_filter_mode,
+                    "action": fallback_action,
+                    "details": str(error),
+                },
+            )
             return
         previous = self.last_action(symbol)
         self._state[symbol] = {"action": decision.action, "last_ts": now}
