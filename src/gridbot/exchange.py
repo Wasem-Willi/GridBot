@@ -37,6 +37,26 @@ def is_insufficient_balance_error(error: requests.HTTPError) -> bool:
     return code in {-2010, -2019} or ("insufficient" in msg and "balance" in msg)
 
 
+def is_unknown_order_error(error: requests.HTTPError) -> bool:
+    """True when Binance rejects a cancel because the order is already gone.
+
+    Binance's bulk cancel-all endpoint (and single-order cancel) returns
+    code -2011 "Unknown order sent." when there are no matching open orders
+    left to cancel, e.g. they already filled or were cancelled by a prior
+    cycle. That is not a real failure and should not block trading.
+    """
+    response = error.response
+    if response is None:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return "unknown order" in (response.text or "").lower()
+    code = body.get("code")
+    msg = str(body.get("msg") or body.get("description") or "").lower()
+    return code == -2011 or "unknown order" in msg
+
+
 @dataclass(frozen=True)
 class FilterValues:
     min_value: Decimal

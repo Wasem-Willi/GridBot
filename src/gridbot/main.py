@@ -18,7 +18,7 @@ from gridbot.ai_filter import (
     OpenAIDecisionClient,
 )
 from gridbot.config import BotConfig, load_config
-from gridbot.exchange import BinanceSpotClient, extract_binance_error_detail
+from gridbot.exchange import BinanceSpotClient, extract_binance_error_detail, is_unknown_order_error
 from gridbot.execution import ExecutionConfig, InsufficientFundsError, OrderPlacementError, sync_grid_orders
 from gridbot.grid_engine import GridLevel, GridPlan, build_grid, is_outside_grid
 from gridbot.pnl import compute_live_pnl_snapshot
@@ -152,6 +152,18 @@ def _handle_insufficient_funds(
         symbol,
         {"reason": "insufficient_funds", "details": error.details},
     )
+
+
+def _cancel_all_orders_ignoring_missing(exchange: BinanceSpotClient, symbol: str) -> None:
+    """Cancel all open orders, tolerating Binance's -2011 'Unknown order
+    sent' response, which just means there was nothing left to cancel
+    (already filled or removed by a prior cycle)."""
+    try:
+        exchange.cancel_all_orders(symbol)
+    except requests.HTTPError as error:
+        if is_unknown_order_error(error):
+            return
+        raise
 
 
 def _handle_order_placement_error(
@@ -920,7 +932,7 @@ def run() -> None:
                     store.set_symbol_paused(symbol, True, "trend_regime")
                     if not cfg.dry_run:
                         try:
-                            exchange.cancel_all_orders(symbol)
+                            _cancel_all_orders_ignoring_missing(exchange, symbol)
                         except requests.HTTPError as error:
                             details = extract_binance_error_detail(error)
                             store.log_risk_event(
@@ -946,7 +958,7 @@ def run() -> None:
                     store.set_symbol_paused(symbol, True, "ai_pause")
                     if not cfg.dry_run:
                         try:
-                            exchange.cancel_all_orders(symbol)
+                            _cancel_all_orders_ignoring_missing(exchange, symbol)
                         except requests.HTTPError as error:
                             details = extract_binance_error_detail(error)
                             store.log_risk_event(
@@ -968,7 +980,7 @@ def run() -> None:
                     store.set_symbol_paused(symbol, True, band_trigger)
                     if not cfg.dry_run:
                         try:
-                            exchange.cancel_all_orders(symbol)
+                            _cancel_all_orders_ignoring_missing(exchange, symbol)
                         except requests.HTTPError as error:
                             details = extract_binance_error_detail(error)
                             store.log_risk_event(
@@ -993,7 +1005,7 @@ def run() -> None:
                 if is_outside_grid(price, current_plan):
                     if not cfg.dry_run:
                         try:
-                            exchange.cancel_all_orders(symbol)
+                            _cancel_all_orders_ignoring_missing(exchange, symbol)
                         except requests.HTTPError as error:
                             details = extract_binance_error_detail(error)
                             _handle_order_placement_error(
