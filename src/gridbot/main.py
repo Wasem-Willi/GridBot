@@ -18,7 +18,12 @@ from gridbot.ai_filter import (
     OpenAIDecisionClient,
 )
 from gridbot.config import BotConfig, load_config
-from gridbot.exchange import BinanceSpotClient, extract_binance_error_detail, is_unknown_order_error
+from gridbot.exchange import (
+    BinanceSpotClient,
+    extract_binance_error_detail,
+    free_balance,
+    is_unknown_order_error,
+)
 from gridbot.execution import ExecutionConfig, InsufficientFundsError, OrderPlacementError, sync_grid_orders
 from gridbot.grid_engine import GridLevel, GridPlan, build_grid, is_outside_grid
 from gridbot.pnl import compute_live_pnl_snapshot
@@ -164,6 +169,74 @@ def _cancel_all_orders_ignoring_missing(exchange: BinanceSpotClient, symbol: str
         if is_unknown_order_error(error):
             return
         raise
+
+
+def _liquidate_symbol_position(
+    exchange: BinanceSpotClient,
+    store: StateStore,
+    alerter: TelegramAlerter,
+    symbol: str,
+    price: float,
+    band_trigger: str,
+) -> None:
+    """Sell any held base-asset balance at market after a stop_loss/take_profit
+    band trigger, so the band actually closes the position instead of just
+    stopping new grid orders. Best-effort: logs and alerts on failure rather
+    than raising, since the symbol is already paused either way."""
+    try:
+        base_asset, _quote_asset = exchange.get_symbol_assets(symbol)
+        account = exchange.get_account()
+        available = free_balance(account, base_asset)
+    except (requests.HTTPError, ValueError) as error:
+        details = extract_binance_error_detail(error) if isinstance(error, requests.HTTPError) else str(error)
+        store.log_risk_event(
+            "band_liquidation_error",
+            symbol,
+            {"band": band_trigger, "details": details, "stage": "balance_lookup"},
+        )
+        alerter.send(f"Liquidation lookup failed for {symbol} ({band_trigger}): {details}")
+        return
+
+    if available <= 0:
+        return
+
+    normalized_qty = exchange.normalize_market_sell_quantity(symbol, price, float(available))
+    if normalized_qty is None:
+        store.log_risk_event(
+            "band_liquidation_skipped_dust",
+            symbol,
+            {"band": band_trigger, "available": float(available)},
+        )
+        return
+
+    try:
+        order = exchange.place_market_order(symbol, "SELL", normalized_qty)
+    except requests.HTTPError as error:
+        details = extract_binance_error_detail(error)
+        store.log_risk_event(
+            "band_liquidation_error",
+            symbol,
+            {"band": band_trigger, "details": details, "stage": "market_sell"},
+        )
+        alerter.send(f"Liquidation SELL failed for {symbol} ({band_trigger}): {details}")
+        return
+
+    order_qty = float(order.get("executedQty", normalized_qty))
+    order_price = float(order.get("price") or price)
+    store.write_order(
+        str(order["orderId"]),
+        symbol,
+        "SELL",
+        order_price,
+        order_qty,
+        str(order.get("status", "FILLED")),
+    )
+    store.log_risk_event(
+        "band_liquidation",
+        symbol,
+        {"band": band_trigger, "quantity": order_qty, "price": price},
+    )
+    alerter.send(f"Liquidated {symbol}: sold {order_qty} (market) after {band_trigger} at ~{price:.8f}")
 
 
 def _handle_order_placement_error(
@@ -991,6 +1064,7 @@ def run() -> None:
                             alerter.send(
                                 f"Cancel all failed while pausing {symbol} for {band_trigger}: {details}"
                             )
+                        _liquidate_symbol_position(exchange, store, alerter, symbol, price, band_trigger)
                     store.log_risk_event("symbol_band_trigger", symbol, {"band": band_trigger, "price": price})
                     alerter.send(f"Symbol paused: {symbol}, reason={band_trigger}, price={price:.8f}")
                     continue

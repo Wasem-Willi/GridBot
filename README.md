@@ -5,7 +5,7 @@ This project scaffolds a real-money-ready **grid trading bot** with strict safet
 - Binance **spot-only**
 - Dynamic symbol rotation (hourly)
 - 1-minute control loop
-- Daily loss stop + per-symbol stop-loss/take-profit bands
+- Daily loss stop + per-symbol stop-loss/take-profit bands (liquidates the held position at market when triggered, not just a pause)
 - Reconciliation safety gate (position/quote/equity drift checks with global halt)
 - Telegram alerts + `/kill` and `/resume` commands
 - SQLite state store
@@ -171,6 +171,7 @@ Env keys:
 - Grid levels are checked against free wallet balances before placement. A USDT-only wallet can place affordable BUY levels; SELL levels are added only when free base-asset inventory exists.
 - If no grid level is affordable, the symbol is paused and an insufficient-funds risk event records the available-balance details.
 - Non-insufficient order placement failures are handled gracefully too: the symbol is paused and alert details are sent to Telegram.
+- Stop-loss/take-profit bands (`PER_SYMBOL_STOP_LOSS_PCT` / `PER_SYMBOL_TAKE_PROFIT_PCT`) cancel open grid orders **and** sell the full free base-asset balance at market, so the band actually closes the position instead of only stopping new orders. Dust balances too small to sell are left untouched and logged as `band_liquidation_skipped_dust`. A failed liquidation attempt is logged as `band_liquidation_error` and alerted, but does not block the pause.
 - Account-equity P/L snapshots are available in `testnet/live` modes via `/pnl` and included in `/status`.
 - The fallback from stale maker orders to taker orders should be added next as a latency- and slippage-aware policy.
 - Fill-by-fill realized PnL tracking is not wired yet; daily report field "Realized PnL today" remains 0 unless explicitly recorded.

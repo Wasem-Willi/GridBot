@@ -93,6 +93,17 @@ def _parse_decimal(value: str | float | int | None, fallback: str = "0") -> Deci
     return Decimal(str(value))
 
 
+def free_balance(account: dict[str, Any], asset: str) -> Decimal:
+    """Extract the free (available) balance of `asset` from a get_account() response."""
+    balances = account.get("balances")
+    if not isinstance(balances, list):
+        raise ValueError("Account response does not contain a balances list")
+    for balance in balances:
+        if isinstance(balance, dict) and balance.get("asset") == asset:
+            return Decimal(str(balance.get("free", "0")))
+    return Decimal("0")
+
+
 class BinanceSpotClient:
     def __init__(self, api_key: str, api_secret: str, base_url: str) -> None:
         self.api_key = api_key
@@ -196,6 +207,31 @@ class BinanceSpotClient:
             if (price_dec * qty_dec) < rules.min_notional:
                 return None
         return float(price_dec), float(qty_dec)
+
+    def normalize_market_sell_quantity(self, symbol: str, price: float, available_quantity: float) -> float | None:
+        """Round an available base-asset balance down to a sellable market-order
+        quantity for `symbol`, honoring lot size and min-notional filters.
+
+        Returns None if the available balance is dust: too small to place any
+        valid order (below the minimum lot size or below min notional at the
+        given reference `price`).
+        """
+        rules = self._load_symbol_rules().get(symbol)
+        if rules is None:
+            return available_quantity if available_quantity > 0 else None
+
+        qty_dec = _quantize_down(_parse_decimal(available_quantity), rules.lot_size_filter.step)
+        if qty_dec <= 0 or qty_dec < rules.lot_size_filter.min_value:
+            return None
+        if qty_dec > rules.lot_size_filter.max_value:
+            qty_dec = _quantize_down(rules.lot_size_filter.max_value, rules.lot_size_filter.step)
+
+        if rules.min_notional is not None and price > 0:
+            price_dec = _parse_decimal(price)
+            if (price_dec * qty_dec) < rules.min_notional:
+                return None
+
+        return float(qty_dec)
 
     def ping(self) -> None:
         self._request("GET", "/api/v3/ping")

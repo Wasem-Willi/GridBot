@@ -8,6 +8,7 @@ import requests
 
 from gridbot.exchange import BinanceSpotClient
 from gridbot.exchange import extract_binance_error_detail, is_insufficient_balance_error
+from gridbot.exchange import free_balance as _free_balance
 from gridbot.grid_engine import GridLevel, GridPlan
 from gridbot.state_store import StateStore
 
@@ -29,16 +30,6 @@ class OrderPlacementError(Exception):
         super().__init__(f"Order placement failed for {symbol}: {details}")
         self.symbol = symbol
         self.details = details
-
-
-def _free_balance(account: dict[str, Any], asset: str) -> Decimal:
-    balances = account.get("balances")
-    if not isinstance(balances, list):
-        raise ValueError("Account response does not contain a balances list")
-    for balance in balances:
-        if isinstance(balance, dict) and balance.get("asset") == asset:
-            return Decimal(str(balance.get("free", "0")))
-    return Decimal("0")
 
 
 def sync_grid_orders(
