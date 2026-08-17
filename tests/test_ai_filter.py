@@ -93,6 +93,28 @@ class AskFreeformTests(unittest.TestCase):
         self.assertNotIn("text", request_body)
 
     @patch("gridbot.ai_filter.requests.post")
+    def test_prepends_bot_context_to_input_when_provided(self, post: Mock) -> None:
+        response = Mock()
+        response.json.return_value = {
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "Bot is RUNNING."}]}]
+        }
+        post.return_value = response
+
+        ask_freeform(
+            "test-api-key",
+            "gpt-4o-mini",
+            20,
+            "Answer concisely.",
+            "Is the bot running?",
+            context="Bot status: RUNNING\nP/L: +1.0 USDT",
+        )
+
+        request_body = post.call_args.kwargs["json"]
+        self.assertIn("Bot context:", request_body["input"])
+        self.assertIn("Bot status: RUNNING\nP/L: +1.0 USDT", request_body["input"])
+        self.assertIn("Operator question: Is the bot running?", request_body["input"])
+
+    @patch("gridbot.ai_filter.requests.post")
     def test_bad_request_includes_openai_error_message(self, post: Mock) -> None:
         response = requests.Response()
         response.status_code = 401

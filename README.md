@@ -203,11 +203,16 @@ Env keys:
 
 Independent of `AI_FILTER_MODE`, send `/ask <question>` in Telegram to get a
 free-text answer from the same OpenAI model (`AI_MODEL`), reusing the
-`OPENAI_API_KEY`. This is a one-way Q&A helper, not a decision-making
-component - it has no access to live prices, balances, or bot state beyond
-what you put in the question, and it never places orders or changes bot
-behavior. If `OPENAI_API_KEY` is not set, `/ask` replies that AI chat isn't
-configured instead of failing silently.
+`OPENAI_API_KEY`. Every question is sent along with a live "bot context"
+snapshot pulled fresh from the store at the moment of the question: current
+bot status (running/halted), a P/L snapshot, and the most recent
+transition/risk events (the same data behind `/status`, `/pnl`, and
+`/transitions`) - so it can answer questions like "is the bot running?" or
+"what happened recently?" directly instead of guessing. It still has no
+access to specific open orders or per-symbol grid levels, and never places
+orders or changes bot behavior - it's a read-only Q&A helper. If
+`OPENAI_API_KEY` is not set, `/ask` replies that AI chat isn't configured
+instead of failing silently.
 
 ## 8) Current v1 scope notes
 

@@ -127,11 +127,23 @@ class OpenAIDecisionClient:
         return AIDecision(action=action, confidence=confidence, reason=reason)
 
 
-def ask_freeform(api_key: str, model: str, timeout_seconds: int, system_prompt: str, question: str) -> str:
+def ask_freeform(
+    api_key: str,
+    model: str,
+    timeout_seconds: int,
+    system_prompt: str,
+    question: str,
+    context: str | None = None,
+) -> str:
     """Send a freeform question to the OpenAI Responses API and return the
     plain-text answer. Unlike OpenAIDecisionClient.decide, the response is
     not constrained to a JSON schema, so this is used for interactive
-    chat (e.g. a Telegram /ask command) rather than bot decisions."""
+    chat (e.g. a Telegram /ask command) rather than bot decisions.
+
+    If context is provided (a snapshot of live bot data such as P/L and
+    recent risk events), it is included alongside the question so the model
+    can ground its answer in the bot's actual current state."""
+    input_text = question if not context else f"Bot context:\n{context}\n\nOperator question: {question}"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -139,7 +151,7 @@ def ask_freeform(api_key: str, model: str, timeout_seconds: int, system_prompt: 
     body = {
         "model": model,
         "instructions": system_prompt,
-        "input": question,
+        "input": input_text,
     }
     response = requests.post(
         "https://api.openai.com/v1/responses",

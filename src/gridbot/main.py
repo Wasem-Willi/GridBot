@@ -102,7 +102,7 @@ def _apply_control_commands(
     pnl_provider: Callable[[], str],
     cancel_all_provider: Callable[[], str],
     start_fresh_provider: Callable[[], tuple[bool, str]],
-    ai_ask_provider: Callable[[str], str],
+    ai_ask_provider: Callable[[str, str], str],
 ) -> tuple[bool, bool]:
     offset_raw = store.get_state("telegram_offset")
     offset = int(offset_raw) if offset_raw is not None else 0
@@ -194,8 +194,9 @@ def _apply_control_commands(
             if not question:
                 alerter.send("Usage: /ask <question>")
             else:
+                context = _build_ai_ask_context(store, bot_halted, pnl_provider)
                 try:
-                    answer = ai_ask_provider(question)
+                    answer = ai_ask_provider(question, context)
                     success = True
                 except (requests.RequestException, ValueError) as error:
                     answer = f"AI chat failed: {error}"
@@ -346,9 +347,8 @@ def _responsive_wait(
     pnl_provider: Callable[[], str],
     cancel_all_provider: Callable[[], str],
     start_fresh_provider: Callable[[], tuple[bool, str]],
-    ai_ask_provider: Callable[[str], str],
+    ai_ask_provider: Callable[[str, str], str],
 ) -> tuple[bool, bool]:
-    remaining = max(wait_seconds, 0)
     step = max(poll_seconds, 1)
     while remaining > 0:
         sleep_for = min(step, remaining)
@@ -460,25 +460,49 @@ def _make_start_fresh_provider(
 
 _AI_CHAT_SYSTEM_PROMPT = (
     "You are GridBot's AI assistant, reachable by the bot operator via Telegram /ask. "
-    "GridBot is a rule-based Binance spot grid trading bot; you do not control it and have "
-    "no live market data, balances, or order state beyond what the operator tells you in "
-    "their question. Answer clearly and concisely. If asked about live prices, balances, "
-    "P/L, or bot status, tell the operator to use /status, /pnl, or /transitions instead of "
-    "guessing."
+    "GridBot is a rule-based Binance spot grid trading bot. Each question is accompanied by "
+    "a 'Bot context' block containing the live bot status, a P/L snapshot, and the most "
+    "recent risk/transition events, all pulled directly from the bot at the moment of the "
+    "question - use that data to answer status/P&L/event questions accurately instead of "
+    "guessing. If the operator asks about something not covered by the context (e.g. "
+    "specific open orders or per-symbol grid levels), say so plainly and suggest /status, "
+    "/pnl, or /transitions for more detail rather than inventing an answer. Answer clearly "
+    "and concisely."
 )
 
 
-def _make_ai_ask_provider(cfg: BotConfig) -> Callable[[str], str]:
-    if not cfg.ai_api_key:
-        return lambda _question: "AI chat is not configured: set OPENAI_API_KEY in .env to enable /ask."
+def _build_ai_ask_context(
+    store: StateStore,
+    bot_halted: bool,
+    pnl_provider: Callable[[], str],
+) -> str:
+    """Snapshot of live bot data handed to the AI assistant alongside the
+    operator's /ask question, so answers are grounded in the bot's actual
+    current state rather than guessed."""
+    try:
+        pnl_text = pnl_provider()
+    except (requests.RequestException, ValueError) as error:
+        pnl_text = f"P/L snapshot unavailable ({error})"
+    status = "STOPPED" if bot_halted else "RUNNING"
+    return (
+        f"Bot status: {status}\n"
+        f"{pnl_text}\n\n"
+        f"{_build_transitions_text(store)}"
+    )
 
-    def _provider(question: str) -> str:
+
+def _make_ai_ask_provider(cfg: BotConfig) -> Callable[[str, str], str]:
+    if not cfg.ai_api_key:
+        return lambda _question, _context: "AI chat is not configured: set OPENAI_API_KEY in .env to enable /ask."
+
+    def _provider(question: str, context: str) -> str:
         return ask_freeform(
             cfg.ai_api_key,
             cfg.ai_model,
             cfg.ai_chat_timeout_seconds,
             _AI_CHAT_SYSTEM_PROMPT,
             question,
+            context=context,
         )
 
     return _provider

@@ -11,6 +11,7 @@ from gridbot.main import (
     OrderPlacementError,
     RegimeController,
     _apply_control_commands,
+    _build_ai_ask_context,
     _build_notify_status_text,
     _handle_order_placement_error,
     _make_ai_ask_provider,
@@ -167,6 +168,7 @@ class ApplyControlCommandsNotifyTests(unittest.TestCase):
 
 class ApplyControlCommandsAskTests(unittest.TestCase):
     def _run(self, store: Mock, alerter: Mock, ai_ask_provider: Mock, commands: list[ControlCommand]) -> None:
+        store.get_recent_risk_events.return_value = []
         alerter.poll_commands.return_value = (commands, 1)
         _apply_control_commands(
             alerter,
@@ -186,7 +188,7 @@ class ApplyControlCommandsAskTests(unittest.TestCase):
 
         self._run(store, alerter, ai_ask_provider, [ControlCommand(name="ask", arg="What is the meaning of life?")])
 
-        ai_ask_provider.assert_called_once_with("What is the meaning of life?")
+        ai_ask_provider.assert_called_once_with("What is the meaning of life?", ANY)
         alerter.send.assert_called_once_with("42 is the answer.")
         store.log_risk_event.assert_called_once_with(
             "ai_chat",
@@ -222,6 +224,40 @@ class ApplyControlCommandsAskTests(unittest.TestCase):
         )
 
 
+class BuildAiAskContextTests(unittest.TestCase):
+    def test_includes_status_pnl_and_transitions(self) -> None:
+        store = _store()
+        event = Mock(created_at="2026-08-17T12:00:00", event_type="band_liquidation", symbol="BTCUSDT", details={"band": "stop_loss"})
+        store.get_recent_risk_events.return_value = [event]
+
+        context = _build_ai_ask_context(store, False, Mock(return_value="P/L: +1.23 USDT"))
+
+        self.assertIn("Bot status: RUNNING", context)
+        self.assertIn("P/L: +1.23 USDT", context)
+        self.assertIn("band_liquidation", context)
+        self.assertIn("BTCUSDT", context)
+
+    def test_reports_halted_status(self) -> None:
+        store = _store()
+        store.get_recent_risk_events.return_value = []
+
+        context = _build_ai_ask_context(store, True, Mock(return_value=""))
+
+        self.assertIn("Bot status: STOPPED", context)
+
+    def test_pnl_provider_failure_is_reported_instead_of_raising(self) -> None:
+        store = _store()
+        store.get_recent_risk_events.return_value = []
+
+        def _failing_pnl() -> str:
+            raise ValueError("exchange unreachable")
+
+        context = _build_ai_ask_context(store, False, _failing_pnl)
+
+        self.assertIn("P/L snapshot unavailable", context)
+        self.assertIn("exchange unreachable", context)
+
+
 class MakeAiAskProviderTests(unittest.TestCase):
     def test_missing_api_key_returns_not_configured_message_without_calling_openai(self) -> None:
         cfg = Mock(ai_api_key="", ai_model="gpt-4o-mini", ai_chat_timeout_seconds=20)
@@ -229,17 +265,17 @@ class MakeAiAskProviderTests(unittest.TestCase):
         provider = _make_ai_ask_provider(cfg)
 
         self.assertEqual(
-            provider("anything"),
+            provider("anything", "some context"),
             "AI chat is not configured: set OPENAI_API_KEY in .env to enable /ask.",
         )
 
     @patch("gridbot.main.ask_freeform")
-    def test_forwards_question_to_ask_freeform_with_cfg_settings(self, ask_freeform: Mock) -> None:
+    def test_forwards_question_and_context_to_ask_freeform_with_cfg_settings(self, ask_freeform: Mock) -> None:
         ask_freeform.return_value = "Grid trading works best in ranging markets."
         cfg = Mock(ai_api_key="sk-test", ai_model="gpt-4o-mini", ai_chat_timeout_seconds=20)
 
         provider = _make_ai_ask_provider(cfg)
-        answer = provider("How does grid trading work?")
+        answer = provider("How does grid trading work?", "Bot status: RUNNING")
 
         self.assertEqual(answer, "Grid trading works best in ranging markets.")
         ask_freeform.assert_called_once_with(
@@ -248,6 +284,7 @@ class MakeAiAskProviderTests(unittest.TestCase):
             20,
             ANY,
             "How does grid trading work?",
+            context="Bot status: RUNNING",
         )
 
 
