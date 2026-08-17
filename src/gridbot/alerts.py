@@ -9,6 +9,7 @@ import requests
 @dataclass(frozen=True)
 class ControlCommand:
     name: str
+    arg: str | None = None
 
 
 class TelegramAlerter:
@@ -59,6 +60,12 @@ class TelegramAlerter:
                 commands.append(ControlCommand(name="cancel_all"))
             elif text == "/start_fresh":
                 commands.append(ControlCommand(name="start_fresh"))
+            elif text == "/notify":
+                commands.append(ControlCommand(name="notify_status"))
+            elif text.startswith("/notify_on"):
+                commands.append(ControlCommand(name="notify_on", arg=text[len("/notify_on"):].strip()))
+            elif text.startswith("/notify_off"):
+                commands.append(ControlCommand(name="notify_off", arg=text[len("/notify_off"):].strip()))
             else:
                 logging.info("Ignoring Telegram command text=%s", text)
         return commands, next_offset

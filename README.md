@@ -80,6 +80,36 @@ docker compose logs -f gridbot
 - `/stop` - stop the bot process
 - `/status` - current bot state + latest P/L snapshot
 - `/pnl` - on-demand near-live account equity P/L snapshot (testnet/live)
+- `/notify` - show live notification toggle status for every category
+- `/notify_on <category>` - turn a notification category on
+- `/notify_off <category>` - turn a notification category off
+
+### Live notification toggles
+
+Each category of live Telegram alert can be turned on or off **at runtime**
+from Telegram itself, with no redeploy or restart needed - send `/notify` to
+see current status and category names, then `/notify_on <category>` or
+`/notify_off <category>` to change one. Toggles persist across bot restarts
+(stored in the bot's local state DB) until changed again. Replies to the
+commands above always send regardless of these flags - they only gate
+passive/background alerts:
+
+| Category | Controls alerts for |
+| --- | --- |
+| `ai_decisions` | AI filter action changes (e.g. `PAUSE -> BOTH`) |
+| `regime` | Regime pause/resume (trending vs ranging) |
+| `liquidation` | Stop-loss/take-profit trigger + liquidation sell results |
+| `order_errors` | Order placement / cancel-all failures |
+| `risk_halts` | Daily loss limit halts and reconciliation halts/gates |
+| `symbol_refresh` | Active symbol rotation announcements |
+| `daily_summary` | The once-a-day summary report |
+
+Example: send `/notify_off symbol_refresh` in Telegram to stop the hourly
+"symbols selected" spam while keeping liquidation and error alerts on; send
+`/notify_on symbol_refresh` to turn it back on. Each category also has a
+matching `NOTIFY_*` env var (e.g. `NOTIFY_SYMBOL_REFRESH=false`) that sets the
+**default** on startup - the Telegram toggle always overrides that default
+once you've used `/notify_on`/`/notify_off` for a category.
 
 ## 6) Rollout path (recommended)
 

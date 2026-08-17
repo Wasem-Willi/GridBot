@@ -87,6 +87,13 @@ class BotConfig:
     timezone_name: str
     db_path: Path
     blacklist_path: Path
+    notify_ai_decisions: bool
+    notify_regime: bool
+    notify_liquidation: bool
+    notify_order_errors: bool
+    notify_risk_halts: bool
+    notify_symbol_refresh: bool
+    notify_daily_summary: bool
 
     @property
     def per_symbol_capital(self) -> float:
@@ -216,4 +223,11 @@ def load_config() -> BotConfig:
         timezone_name=_get_env("TIMEZONE", "Asia/Jerusalem"),
         db_path=Path(_get_env("DB_PATH", "data/gridbot.db")),
         blacklist_path=Path(_get_env("BLACKLIST_PATH", "config/blacklist.txt")),
+        notify_ai_decisions=_get_bool("NOTIFY_AI_DECISIONS", True),
+        notify_regime=_get_bool("NOTIFY_REGIME", True),
+        notify_liquidation=_get_bool("NOTIFY_LIQUIDATION", True),
+        notify_order_errors=_get_bool("NOTIFY_ORDER_ERRORS", True),
+        notify_risk_halts=_get_bool("NOTIFY_RISK_HALTS", True),
+        notify_symbol_refresh=_get_bool("NOTIFY_SYMBOL_REFRESH", True),
+        notify_daily_summary=_get_bool("NOTIFY_DAILY_SUMMARY", True),
     )

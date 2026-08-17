@@ -54,6 +54,37 @@ def _setup_logging() -> None:
     )
 
 
+NOTIFICATION_CATEGORIES: dict[str, str] = {
+    "ai_decisions": "AI filter action changes",
+    "regime": "Regime pause/resume",
+    "liquidation": "Stop-loss/take-profit + liquidation",
+    "order_errors": "Order placement / cancel-all failures",
+    "risk_halts": "Daily loss limit + reconciliation halts",
+    "symbol_refresh": "Active symbol rotation announcements",
+    "daily_summary": "Daily summary report",
+}
+
+
+def _notify_enabled(store: StateStore, cfg: BotConfig, category: str) -> bool:
+    """Live-toggleable notification check. A Telegram /notify_on|/notify_off
+    override (persisted in the state store) always wins; otherwise falls
+    back to the NOTIFY_* env var default from BotConfig."""
+    override = store.get_state(f"notify_{category}")
+    if override is not None:
+        return override == "1"
+    return bool(getattr(cfg, f"notify_{category}"))
+
+
+def _build_notify_status_text(store: StateStore, cfg: BotConfig) -> str:
+    lines = ["GridBot live notification toggles:"]
+    for category, label in NOTIFICATION_CATEGORIES.items():
+        state = "ON" if _notify_enabled(store, cfg, category) else "OFF"
+        lines.append(f"[{state}] {category} - {label}")
+    lines.append("")
+    lines.append("Use /notify_on <category> or /notify_off <category> to change.")
+    return "\n".join(lines)
+
+
 def _load_blacklist(path: Path) -> set[str]:
     if not path.exists():
         raise FileNotFoundError(f"Blacklist file not found: {path}")
@@ -64,6 +95,7 @@ def _load_blacklist(path: Path) -> set[str]:
 def _apply_control_commands(
     alerter: TelegramAlerter,
     store: StateStore,
+    cfg: BotConfig,
     bot_halted: bool,
     pnl_provider: Callable[[], str],
     cancel_all_provider: Callable[[], str],
@@ -128,6 +160,23 @@ def _apply_control_commands(
                 None,
                 {"source": "telegram", "success": 1 if success else 0, "result": fresh_message},
             )
+        elif command.name == "notify_status":
+            alerter.send(_build_notify_status_text(store, cfg))
+        elif command.name in {"notify_on", "notify_off"}:
+            category = (command.arg or "").strip().lower()
+            if category not in NOTIFICATION_CATEGORIES:
+                valid = ", ".join(NOTIFICATION_CATEGORIES)
+                alerter.send(f"Unknown notify category '{category}'. Valid: {valid}")
+            else:
+                enabled = command.name == "notify_on"
+                store.set_state(f"notify_{category}", "1" if enabled else "0")
+                state_word = "ON" if enabled else "OFF"
+                alerter.send(f"Notifications for '{category}' turned {state_word}.")
+                store.log_risk_event(
+                    "notify_toggle",
+                    None,
+                    {"category": category, "enabled": 1 if enabled else 0, "source": "telegram"},
+                )
     return bot_halted, should_stop
 
 
@@ -136,12 +185,14 @@ def _refresh_symbols(
     exchange: BinanceSpotClient,
     blacklist: set[str],
     alerter: TelegramAlerter,
+    store: StateStore,
 ) -> list[str]:
     logging.info("Refreshing symbol shortlist...")
     ranked = select_symbols(exchange, blacklist, cfg.max_active_symbols)
     symbols = [r.symbol for r in ranked]
     logging.info("Selected symbols: %s", ", ".join(symbols) if symbols else "none")
-    alerter.send("GridBot symbol refresh: " + (", ".join(symbols) if symbols else "none"))
+    if _notify_enabled(store, cfg, "symbol_refresh"):
+        alerter.send("GridBot symbol refresh: " + (", ".join(symbols) if symbols else "none"))
     return symbols
 
 
@@ -178,6 +229,7 @@ def _liquidate_symbol_position(
     symbol: str,
     price: float,
     band_trigger: str,
+    cfg: BotConfig,
 ) -> None:
     """Sell any held base-asset balance at market after a stop_loss/take_profit
     band trigger, so the band actually closes the position instead of just
@@ -194,7 +246,8 @@ def _liquidate_symbol_position(
             symbol,
             {"band": band_trigger, "details": details, "stage": "balance_lookup"},
         )
-        alerter.send(f"Liquidation lookup failed for {symbol} ({band_trigger}): {details}")
+        if _notify_enabled(store, cfg, "liquidation"):
+            alerter.send(f"Liquidation lookup failed for {symbol} ({band_trigger}): {details}")
         return
 
     if available <= 0:
@@ -218,7 +271,8 @@ def _liquidate_symbol_position(
             symbol,
             {"band": band_trigger, "details": details, "stage": "market_sell"},
         )
-        alerter.send(f"Liquidation SELL failed for {symbol} ({band_trigger}): {details}")
+        if _notify_enabled(store, cfg, "liquidation"):
+            alerter.send(f"Liquidation SELL failed for {symbol} ({band_trigger}): {details}")
         return
 
     order_qty = float(order.get("executedQty", normalized_qty))
@@ -236,7 +290,8 @@ def _liquidate_symbol_position(
         symbol,
         {"band": band_trigger, "quantity": order_qty, "price": price},
     )
-    alerter.send(f"Liquidated {symbol}: sold {order_qty} (market) after {band_trigger} at ~{price:.8f}")
+    if _notify_enabled(store, cfg, "liquidation"):
+        alerter.send(f"Liquidated {symbol}: sold {order_qty} (market) after {band_trigger} at ~{price:.8f}")
 
 
 def _handle_order_placement_error(
@@ -244,10 +299,12 @@ def _handle_order_placement_error(
     alerter: TelegramAlerter,
     symbol: str,
     error: OrderPlacementError,
+    cfg: BotConfig,
 ) -> None:
     store.set_symbol_paused(symbol, True, "order_placement_error")
     store.log_risk_event("order_placement_error", symbol, {"details": error.details})
-    alerter.send(f"Symbol paused: {symbol}, reason=order_placement_error, details={error.details}")
+    if _notify_enabled(store, cfg, "order_errors"):
+        alerter.send(f"Symbol paused: {symbol}, reason=order_placement_error, details={error.details}")
 
 
 def _responsive_wait(
@@ -255,6 +312,7 @@ def _responsive_wait(
     poll_seconds: int,
     alerter: TelegramAlerter,
     store: StateStore,
+    cfg: BotConfig,
     bot_halted: bool,
     pnl_provider: Callable[[], str],
     cancel_all_provider: Callable[[], str],
@@ -269,6 +327,7 @@ def _responsive_wait(
         bot_halted, should_stop = _apply_control_commands(
             alerter,
             store,
+            cfg,
             bot_halted,
             pnl_provider,
             cancel_all_provider,
@@ -379,7 +438,10 @@ def _build_help_text() -> str:
         "/start_fresh - cancel all open orders, reset local state, and restart fresh\n"
         "/kill - halt trading loop\n"
         "/resume - resume trading\n"
-        "/stop - stop bot process"
+        "/stop - stop bot process\n"
+        "/notify - show live notification toggle status\n"
+        "/notify_on <category> - turn a notification category on\n"
+        "/notify_off <category> - turn a notification category off"
     )
 
 
@@ -552,11 +614,13 @@ class RegimeController:
 
     def note_pause(self, symbol: str) -> None:
         self.pauses_today += 1
-        self._alerter.send(f"GridBot regime: {symbol} paused (trending regime).")
+        if _notify_enabled(self._store, self._cfg, "regime"):
+            self._alerter.send(f"GridBot regime: {symbol} paused (trending regime).")
 
     def note_resume(self, symbol: str) -> None:
         self.resumes_today += 1
-        self._alerter.send(f"GridBot regime: {symbol} resumed (ranging regime).")
+        if _notify_enabled(self._store, self._cfg, "regime"):
+            self._alerter.send(f"GridBot regime: {symbol} resumed (ranging regime).")
 
 
 def _plan_for_ai_action(plan: GridPlan, action: str) -> GridPlan:
@@ -672,7 +736,7 @@ class AIFilterController:
                 "reason": decision.reason,
             },
         )
-        if self.active and previous != decision.action:
+        if self.active and previous != decision.action and _notify_enabled(self._store, self._cfg, "ai_decisions"):
             self._alerter.send(
                 f"GridBot AI: {symbol} action {previous} -> {decision.action} "
                 f"(confidence={decision.confidence:.2f})"
@@ -731,7 +795,7 @@ def run() -> None:
                 f"Details: {details}. "
                 "For MODE=testnet, verify testnet key/secret pair and endpoint."
             ) from error
-    active_symbols = _refresh_symbols(cfg, exchange, blacklist, alerter)
+    active_symbols = _refresh_symbols(cfg, exchange, blacklist, alerter, store)
     _run_startup_safety_gate(cfg, exchange, store, active_symbols)
     next_symbol_refresh = datetime.now(tz) + timedelta(minutes=cfg.symbol_refresh_minutes)
     last_report_day = store.get_state("last_report_day")
@@ -751,6 +815,7 @@ def run() -> None:
             bot_halted, should_stop = _apply_control_commands(
                 alerter,
                 store,
+                cfg,
                 bot_halted,
                 pnl_provider,
                 cancel_all_provider,
@@ -765,7 +830,7 @@ def run() -> None:
             )
 
             if now >= next_symbol_refresh:
-                active_symbols = _refresh_symbols(cfg, exchange, blacklist, alerter)
+                active_symbols = _refresh_symbols(cfg, exchange, blacklist, alerter, store)
                 next_symbol_refresh = now + timedelta(minutes=cfg.symbol_refresh_minutes)
 
             regime.roll_day(store.get_day_key())
@@ -778,9 +843,10 @@ def run() -> None:
                     None,
                     {"realized_pnl": risk.realized_pnl, "threshold": risk.threshold},
                 )
-                alerter.send(
-                    f"GridBot halted: daily loss limit hit. pnl={risk.realized_pnl:.4f}, threshold={risk.threshold:.4f}"
-                )
+                if _notify_enabled(store, cfg, "risk_halts"):
+                    alerter.send(
+                        f"GridBot halted: daily loss limit hit. pnl={risk.realized_pnl:.4f}, threshold={risk.threshold:.4f}"
+                    )
 
             store.set_state("bot_halted", "1" if bot_halted else "0")
 
@@ -793,7 +859,8 @@ def run() -> None:
                     if resume_block_active and clean_cycles >= cfg.reconciliation_clean_cycles_required:
                         resume_block_active = False
                         store.set_state(resume_block_key, "0")
-                        alerter.send("Reconciliation recovery gate satisfied. Manual /resume now allowed.")
+                        if _notify_enabled(store, cfg, "risk_halts"):
+                            alerter.send("Reconciliation recovery gate satisfied. Manual /resume now allowed.")
                 else:
                     clean_cycles = 0
                     store.set_state(clean_cycles_key, "0")
@@ -812,17 +879,19 @@ def run() -> None:
                                 "equity_drift_usdt": rec_result.equity_drift_usdt,
                             },
                         )
-                        alerter.send(f"GridBot halted: {_build_reconciliation_status(rec_result)}")
+                        if _notify_enabled(store, cfg, "risk_halts"):
+                            alerter.send(f"GridBot halted: {_build_reconciliation_status(rec_result)}")
 
             if resume_block_active and clean_cycles < cfg.reconciliation_clean_cycles_required:
                 if not bot_halted:
                     bot_halted = True
                     store.set_state("bot_halted", "1")
                     remaining = cfg.reconciliation_clean_cycles_required - clean_cycles
-                    alerter.send(
-                        "Resume blocked by reconciliation gate. "
-                        f"Required clean cycles remaining: {remaining}."
-                    )
+                    if _notify_enabled(store, cfg, "risk_halts"):
+                        alerter.send(
+                            "Resume blocked by reconciliation gate. "
+                            f"Required clean cycles remaining: {remaining}."
+                        )
 
             if bot_halted:
                 if cfg.reconciliation_enabled and cfg.reconciliation_check_on_halt and not cfg.dry_run:
@@ -835,6 +904,7 @@ def run() -> None:
                     cfg.command_poll_seconds,
                     alerter,
                     store,
+                    cfg,
                     bot_halted,
                     pnl_provider,
                     cancel_all_provider,
@@ -848,6 +918,7 @@ def run() -> None:
                 bot_halted, should_stop = _apply_control_commands(
                     alerter,
                     store,
+                    cfg,
                     bot_halted,
                     pnl_provider,
                     cancel_all_provider,
@@ -921,7 +992,7 @@ def run() -> None:
                     except InsufficientFundsError as error:
                         _handle_insufficient_funds(store, alerter, symbol, error)
                     except OrderPlacementError as error:
-                        _handle_order_placement_error(store, alerter, symbol, error)
+                        _handle_order_placement_error(store, alerter, symbol, error, cfg)
                     continue
 
                 if state.paused:
@@ -963,7 +1034,7 @@ def run() -> None:
                             except InsufficientFundsError as error:
                                 _handle_insufficient_funds(store, alerter, symbol, error)
                             except OrderPlacementError as error:
-                                _handle_order_placement_error(store, alerter, symbol, error)
+                                _handle_order_placement_error(store, alerter, symbol, error, cfg)
                         continue
                     if state.pause_reason == "ai_pause":
                         ai_filter.refresh(
@@ -1013,9 +1084,10 @@ def run() -> None:
                                 symbol,
                                 {"context": "trend_regime", "details": details},
                             )
-                            alerter.send(
-                                f"Cancel all failed while pausing {symbol} for trend_regime: {details}"
-                            )
+                            if _notify_enabled(store, cfg, "order_errors"):
+                                alerter.send(
+                                    f"Cancel all failed while pausing {symbol} for trend_regime: {details}"
+                                )
                     store.log_risk_event("regime_pause", symbol, {"price": price})
                     regime.note_pause(symbol)
                     continue
@@ -1039,7 +1111,8 @@ def run() -> None:
                                 symbol,
                                 {"context": "ai_pause", "details": details},
                             )
-                            alerter.send(f"Cancel all failed while pausing {symbol} for ai_pause: {details}")
+                            if _notify_enabled(store, cfg, "order_errors"):
+                                alerter.send(f"Cancel all failed while pausing {symbol} for ai_pause: {details}")
                     store.log_risk_event("ai_pause", symbol, {"price": price})
                     continue
 
@@ -1061,12 +1134,14 @@ def run() -> None:
                                 symbol,
                                 {"context": "symbol_band_trigger", "details": details},
                             )
-                            alerter.send(
-                                f"Cancel all failed while pausing {symbol} for {band_trigger}: {details}"
-                            )
-                        _liquidate_symbol_position(exchange, store, alerter, symbol, price, band_trigger)
+                            if _notify_enabled(store, cfg, "order_errors"):
+                                alerter.send(
+                                    f"Cancel all failed while pausing {symbol} for {band_trigger}: {details}"
+                                )
+                        _liquidate_symbol_position(exchange, store, alerter, symbol, price, band_trigger, cfg)
                     store.log_risk_event("symbol_band_trigger", symbol, {"band": band_trigger, "price": price})
-                    alerter.send(f"Symbol paused: {symbol}, reason={band_trigger}, price={price:.8f}")
+                    if _notify_enabled(store, cfg, "liquidation"):
+                        alerter.send(f"Symbol paused: {symbol}, reason={band_trigger}, price={price:.8f}")
                     continue
 
                 current_plan = build_grid(
@@ -1087,6 +1162,7 @@ def run() -> None:
                                 alerter,
                                 symbol,
                                 OrderPlacementError(symbol, f"cancel_all_orders failed: {details}"),
+                                cfg,
                             )
                             continue
                     recentered = build_grid(symbol, price, cfg.grid_spacing_pct, cfg.grid_levels, cfg.per_symbol_capital)
@@ -1107,7 +1183,7 @@ def run() -> None:
                     except InsufficientFundsError as error:
                         _handle_insufficient_funds(store, alerter, symbol, error)
                     except OrderPlacementError as error:
-                        _handle_order_placement_error(store, alerter, symbol, error)
+                        _handle_order_placement_error(store, alerter, symbol, error, cfg)
                 else:
                     effective_current_plan = _plan_for_ai_action(
                         current_plan,
@@ -1118,7 +1194,7 @@ def run() -> None:
                     except InsufficientFundsError as error:
                         _handle_insufficient_funds(store, alerter, symbol, error)
                     except OrderPlacementError as error:
-                        _handle_order_placement_error(store, alerter, symbol, error)
+                        _handle_order_placement_error(store, alerter, symbol, error, cfg)
 
             if should_stop:
                 break
@@ -1140,7 +1216,8 @@ def run() -> None:
                     regime_pauses=regime.pauses_today,
                     regime_resumes=regime.resumes_today,
                 )
-                alerter.send(summary)
+                if _notify_enabled(store, cfg, "daily_summary"):
+                    alerter.send(summary)
                 store.set_state("last_report_day", day_key)
                 last_report_day = day_key
 
@@ -1149,6 +1226,7 @@ def run() -> None:
                 cfg.command_poll_seconds,
                 alerter,
                 store,
+                cfg,
                 bot_halted,
                 pnl_provider,
                 cancel_all_provider,
