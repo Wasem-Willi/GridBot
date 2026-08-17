@@ -64,5 +64,60 @@ class GetRiskEventsSinceTests(unittest.TestCase):
         self.assertEqual(events, [])
 
 
+class SymbolStateRiskAnchorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.store = StateStore(Path(self._tmpdir.name) / "test.db", "UTC")
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self._tmpdir.cleanup()
+
+    def test_new_symbol_defaults_anchor_to_center_price(self) -> None:
+        self.store.upsert_symbol_state(
+            "BTCUSDT", center_price=60000.0, lower_bound=58000.0, upper_bound=62000.0, paused=False, pause_reason=None
+        )
+
+        state = self.store.get_symbol_state("BTCUSDT")
+
+        self.assertEqual(state.risk_anchor_price, 60000.0)
+
+    def test_recenter_preserves_existing_anchor(self) -> None:
+        self.store.upsert_symbol_state(
+            "BTCUSDT", center_price=60000.0, lower_bound=58000.0, upper_bound=62000.0, paused=False, pause_reason=None
+        )
+
+        # Grid recenters to a new center_price without passing risk_anchor_price explicitly.
+        self.store.upsert_symbol_state(
+            "BTCUSDT", center_price=61000.0, lower_bound=59000.0, upper_bound=63000.0, paused=False, pause_reason=None
+        )
+
+        state = self.store.get_symbol_state("BTCUSDT")
+        self.assertEqual(state.center_price, 61000.0)
+        self.assertEqual(state.risk_anchor_price, 60000.0)
+
+    def test_set_symbol_paused_preserves_anchor(self) -> None:
+        self.store.upsert_symbol_state(
+            "BTCUSDT", center_price=60000.0, lower_bound=58000.0, upper_bound=62000.0, paused=False, pause_reason=None
+        )
+
+        self.store.set_symbol_paused("BTCUSDT", True, "trend_regime")
+
+        state = self.store.get_symbol_state("BTCUSDT")
+        self.assertTrue(state.paused)
+        self.assertEqual(state.risk_anchor_price, 60000.0)
+
+    def test_reset_risk_anchor_overrides_existing_anchor(self) -> None:
+        self.store.upsert_symbol_state(
+            "BTCUSDT", center_price=60000.0, lower_bound=58000.0, upper_bound=62000.0, paused=False, pause_reason=None
+        )
+
+        self.store.reset_risk_anchor("BTCUSDT", 57000.0)
+
+        state = self.store.get_symbol_state("BTCUSDT")
+        self.assertEqual(state.risk_anchor_price, 57000.0)
+        self.assertEqual(state.center_price, 60000.0)
+
+
 if __name__ == "__main__":
     unittest.main()

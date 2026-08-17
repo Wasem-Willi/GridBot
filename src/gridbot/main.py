@@ -666,6 +666,7 @@ def _make_ai_tool_executor(
                         "paused": state.paused,
                         "pause_reason": state.pause_reason,
                         "updated_at": state.updated_at,
+                        "risk_anchor_price": state.risk_anchor_price,
                     }
                 )
             if name == "cancel_all_orders":
@@ -1474,7 +1475,7 @@ def run() -> None:
                     continue
 
                 band_trigger = check_symbol_band(
-                    center_price=state.center_price,
+                    anchor_price=state.risk_anchor_price,
                     current_price=price,
                     stop_loss_pct=cfg.per_symbol_stop_loss_pct,
                     take_profit_pct=cfg.per_symbol_take_profit_pct,
@@ -1496,6 +1497,8 @@ def run() -> None:
                                     f"Cancel all failed while pausing {symbol} for {band_trigger}: {details}"
                                 )
                         _liquidate_symbol_position(exchange, store, alerter, symbol, price, band_trigger, cfg)
+                        # Position is flat again after liquidation; start a fresh risk anchor for next time.
+                        store.reset_risk_anchor(symbol, price)
                     store.log_risk_event("symbol_band_trigger", symbol, {"band": band_trigger, "price": price})
                     if _notify_enabled(store, cfg, "liquidation"):
                         alerter.send(f"Symbol paused: {symbol}, reason={band_trigger}, price={price:.8f}")

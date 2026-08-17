@@ -17,6 +17,7 @@ class SymbolState:
     paused: bool
     pause_reason: str | None
     updated_at: str
+    risk_anchor_price: float
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class StateStore:
         self.conn.row_factory = sqlite3.Row
         self.tz = ZoneInfo(timezone_name)
         self._init_schema()
+        self._migrate_schema()
 
     def _init_schema(self) -> None:
         self.conn.executescript(
@@ -86,26 +88,49 @@ class StateStore:
         )
         self.conn.commit()
 
+    def _migrate_schema(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(symbol_state)").fetchall()}
+        if "risk_anchor_price" not in columns:
+            self.conn.execute("ALTER TABLE symbol_state ADD COLUMN risk_anchor_price REAL")
+            self.conn.execute("UPDATE symbol_state SET risk_anchor_price = center_price WHERE risk_anchor_price IS NULL")
+            self.conn.commit()
+
     def close(self) -> None:
         self.conn.close()
 
     def upsert_symbol_state(
-        self, symbol: str, center_price: float, lower_bound: float, upper_bound: float, paused: bool, pause_reason: str | None
+        self,
+        symbol: str,
+        center_price: float,
+        lower_bound: float,
+        upper_bound: float,
+        paused: bool,
+        pause_reason: str | None,
+        risk_anchor_price: float | None = None,
     ) -> None:
+        """risk_anchor_price defaults to the existing row's anchor (or
+        center_price for a brand-new symbol) so grid recentering never
+        resets the stop-loss/take-profit reference point. Pass it
+        explicitly only to intentionally start a new risk anchor (e.g. a
+        fresh position after the old one was liquidated)."""
+        if risk_anchor_price is None:
+            existing = self.get_symbol_state(symbol)
+            risk_anchor_price = existing.risk_anchor_price if existing is not None else center_price
         now = datetime.now(self.tz).isoformat()
         self.conn.execute(
             """
-            INSERT INTO symbol_state(symbol, center_price, lower_bound, upper_bound, paused, pause_reason, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO symbol_state(symbol, center_price, lower_bound, upper_bound, paused, pause_reason, updated_at, risk_anchor_price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 center_price=excluded.center_price,
                 lower_bound=excluded.lower_bound,
                 upper_bound=excluded.upper_bound,
                 paused=excluded.paused,
                 pause_reason=excluded.pause_reason,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                risk_anchor_price=excluded.risk_anchor_price
             """,
-            (symbol, center_price, lower_bound, upper_bound, 1 if paused else 0, pause_reason, now),
+            (symbol, center_price, lower_bound, upper_bound, 1 if paused else 0, pause_reason, now, risk_anchor_price),
         )
         self.conn.commit()
 
@@ -113,6 +138,7 @@ class StateStore:
         row = self.conn.execute("SELECT * FROM symbol_state WHERE symbol = ?", (symbol,)).fetchone()
         if row is None:
             return None
+        raw_anchor = row["risk_anchor_price"]
         return SymbolState(
             symbol=row["symbol"],
             center_price=float(row["center_price"]),
@@ -121,6 +147,7 @@ class StateStore:
             paused=bool(row["paused"]),
             pause_reason=row["pause_reason"],
             updated_at=str(row["updated_at"]),
+            risk_anchor_price=float(raw_anchor) if raw_anchor is not None else float(row["center_price"]),
         )
 
     def set_symbol_paused(self, symbol: str, paused: bool, reason: str | None) -> None:
@@ -134,6 +161,23 @@ class StateStore:
             upper_bound=state.upper_bound,
             paused=paused,
             pause_reason=reason,
+            risk_anchor_price=state.risk_anchor_price,
+        )
+
+    def reset_risk_anchor(self, symbol: str, anchor_price: float) -> None:
+        """Start a fresh stop-loss/take-profit reference point, e.g. after a
+        band liquidation flattens the position."""
+        state = self.get_symbol_state(symbol)
+        if state is None:
+            return
+        self.upsert_symbol_state(
+            symbol=symbol,
+            center_price=state.center_price,
+            lower_bound=state.lower_bound,
+            upper_bound=state.upper_bound,
+            paused=state.paused,
+            pause_reason=state.pause_reason,
+            risk_anchor_price=anchor_price,
         )
 
     def write_order(

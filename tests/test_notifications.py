@@ -458,6 +458,7 @@ class MakeAiToolExecutorTests(unittest.TestCase):
             paused=False,
             pause_reason=None,
             updated_at="2026-08-17T12:00:00",
+            risk_anchor_price=60000.0,
         )
         executor, _ = self._executor(store=store)
 

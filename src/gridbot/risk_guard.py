@@ -19,13 +19,17 @@ def check_daily_loss_limit(store: StateStore, capital_usdt: float, daily_loss_li
 
 
 def check_symbol_band(
-    center_price: float,
+    anchor_price: float,
     current_price: float,
     stop_loss_pct: float,
     take_profit_pct: float,
 ) -> str | None:
-    lower = center_price * (1.0 - stop_loss_pct)
-    upper = center_price * (1.0 + take_profit_pct)
+    """anchor_price is the risk reference point (set once when a position is
+    opened), not the grid's center_price - the grid recenters far more often
+    than the band would ever trigger, so measuring against center_price would
+    make the band nearly unreachable during an ordinary trending drift."""
+    lower = anchor_price * (1.0 - stop_loss_pct)
+    upper = anchor_price * (1.0 + take_profit_pct)
     if current_price <= lower:
         return "stop_loss"
     if current_price >= upper:
