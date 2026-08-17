@@ -82,6 +82,7 @@ def _build_notify_status_text(store: StateStore, cfg: BotConfig) -> str:
         lines.append(f"[{state}] {category} - {label}")
     lines.append("")
     lines.append("Use /notify_on <category> or /notify_off <category> to change.")
+    lines.append("Use 'all' as the category to toggle every category at once.")
     return "\n".join(lines)
 
 
@@ -164,13 +165,22 @@ def _apply_control_commands(
             alerter.send(_build_notify_status_text(store, cfg))
         elif command.name in {"notify_on", "notify_off"}:
             category = (command.arg or "").strip().lower()
-            if category not in NOTIFICATION_CATEGORIES:
-                valid = ", ".join(NOTIFICATION_CATEGORIES)
+            enabled = command.name == "notify_on"
+            state_word = "ON" if enabled else "OFF"
+            if category == "all":
+                for name in NOTIFICATION_CATEGORIES:
+                    store.set_state(f"notify_{name}", "1" if enabled else "0")
+                alerter.send(f"All notification categories turned {state_word}.")
+                store.log_risk_event(
+                    "notify_toggle",
+                    None,
+                    {"category": "all", "enabled": 1 if enabled else 0, "source": "telegram"},
+                )
+            elif category not in NOTIFICATION_CATEGORIES:
+                valid = ", ".join([*NOTIFICATION_CATEGORIES, "all"])
                 alerter.send(f"Unknown notify category '{category}'. Valid: {valid}")
             else:
-                enabled = command.name == "notify_on"
                 store.set_state(f"notify_{category}", "1" if enabled else "0")
-                state_word = "ON" if enabled else "OFF"
                 alerter.send(f"Notifications for '{category}' turned {state_word}.")
                 store.log_risk_event(
                     "notify_toggle",
@@ -440,8 +450,8 @@ def _build_help_text() -> str:
         "/resume - resume trading\n"
         "/stop - stop bot process\n"
         "/notify - show live notification toggle status\n"
-        "/notify_on <category> - turn a notification category on\n"
-        "/notify_off <category> - turn a notification category off"
+        "/notify_on <category|all> - turn a notification category (or all) on\n"
+        "/notify_off <category|all> - turn a notification category (or all) off"
     )
 
 

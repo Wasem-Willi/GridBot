@@ -130,6 +130,38 @@ class ApplyControlCommandsNotifyTests(unittest.TestCase):
         alerter.send.assert_called_once()
         self.assertIn("Unknown notify category", alerter.send.call_args.args[0])
 
+    def test_notify_off_all_disables_every_category(self) -> None:
+        store = _store()
+        alerter = Mock()
+        cfg = Mock()
+
+        self._run(store, alerter, cfg, [ControlCommand(name="notify_off", arg="all")])
+
+        for category in NOTIFICATION_CATEGORIES:
+            store.set_state.assert_any_call(f"notify_{category}", "0")
+        alerter.send.assert_called_once_with("All notification categories turned OFF.")
+
+    def test_notify_on_all_enables_every_category(self) -> None:
+        store = _store()
+        alerter = Mock()
+        cfg = Mock()
+
+        self._run(store, alerter, cfg, [ControlCommand(name="notify_on", arg="all")])
+
+        for category in NOTIFICATION_CATEGORIES:
+            store.set_state.assert_any_call(f"notify_{category}", "1")
+        alerter.send.assert_called_once_with("All notification categories turned ON.")
+
+    def test_notify_off_all_is_case_insensitive(self) -> None:
+        store = _store()
+        alerter = Mock()
+        cfg = Mock()
+
+        self._run(store, alerter, cfg, [ControlCommand(name="notify_off", arg="ALL")])
+
+        for category in NOTIFICATION_CATEGORIES:
+            store.set_state.assert_any_call(f"notify_{category}", "0")
+
 
 class NotificationFlagTests(unittest.TestCase):
     def test_symbol_refresh_alert_suppressed_when_disabled(self) -> None:

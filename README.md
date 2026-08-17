@@ -81,15 +81,17 @@ docker compose logs -f gridbot
 - `/status` - current bot state + latest P/L snapshot
 - `/pnl` - on-demand near-live account equity P/L snapshot (testnet/live)
 - `/notify` - show live notification toggle status for every category
-- `/notify_on <category>` - turn a notification category on
-- `/notify_off <category>` - turn a notification category off
+- `/notify_on <category|all>` - turn a notification category (or all) on
+- `/notify_off <category|all>` - turn a notification category (or all) off
 
 ### Live notification toggles
 
 Each category of live Telegram alert can be turned on or off **at runtime**
 from Telegram itself, with no redeploy or restart needed - send `/notify` to
 see current status and category names, then `/notify_on <category>` or
-`/notify_off <category>` to change one. Toggles persist across bot restarts
+`/notify_off <category>` to change one. Use `all` instead of a category name
+to toggle every category in one shot (e.g. `/notify_off all` to go silent,
+`/notify_on all` to restore everything). Toggles persist across bot restarts
 (stored in the bot's local state DB) until changed again. Replies to the
 commands above always send regardless of these flags - they only gate
 passive/background alerts:
