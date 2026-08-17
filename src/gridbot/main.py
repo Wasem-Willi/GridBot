@@ -349,6 +349,7 @@ def _responsive_wait(
     start_fresh_provider: Callable[[], tuple[bool, str]],
     ai_ask_provider: Callable[[str, str], str],
 ) -> tuple[bool, bool]:
+    remaining = max(wait_seconds, 0)
     step = max(poll_seconds, 1)
     while remaining > 0:
         sleep_for = min(step, remaining)

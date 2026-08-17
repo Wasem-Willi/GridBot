@@ -17,6 +17,7 @@ from gridbot.main import (
     _make_ai_ask_provider,
     _notify_enabled,
     _refresh_symbols,
+    _responsive_wait,
 )
 
 
@@ -286,6 +287,48 @@ class MakeAiAskProviderTests(unittest.TestCase):
             "How does grid trading work?",
             context="Bot status: RUNNING",
         )
+
+
+class ResponsiveWaitTests(unittest.TestCase):
+    """Regression coverage for _responsive_wait's polling loop itself -
+    previously untested, which let an UnboundLocalError on `remaining` slip
+    through a full green test run and crash the live bot on startup."""
+
+    @patch("gridbot.main.time.sleep")
+    @patch("gridbot.main._apply_control_commands")
+    def test_polls_until_wait_seconds_elapsed(self, apply_control_commands: Mock, sleep: Mock) -> None:
+        apply_control_commands.return_value = (False, False)
+
+        bot_halted, should_stop = _responsive_wait(
+            10, 3, Mock(), Mock(), Mock(), False, Mock(), Mock(), Mock(), Mock()
+        )
+
+        self.assertEqual(apply_control_commands.call_count, 4)  # ceil(10 / 3)
+        self.assertFalse(bot_halted)
+        self.assertFalse(should_stop)
+
+    @patch("gridbot.main.time.sleep")
+    @patch("gridbot.main._apply_control_commands")
+    def test_stops_early_when_should_stop_returned(self, apply_control_commands: Mock, sleep: Mock) -> None:
+        apply_control_commands.return_value = (True, True)
+
+        bot_halted, should_stop = _responsive_wait(
+            60, 5, Mock(), Mock(), Mock(), False, Mock(), Mock(), Mock(), Mock()
+        )
+
+        apply_control_commands.assert_called_once()
+        self.assertTrue(bot_halted)
+        self.assertTrue(should_stop)
+
+    @patch("gridbot.main.time.sleep")
+    @patch("gridbot.main._apply_control_commands")
+    def test_zero_wait_seconds_returns_without_polling(self, apply_control_commands: Mock, sleep: Mock) -> None:
+        bot_halted, should_stop = _responsive_wait(
+            0, 5, Mock(), Mock(), Mock(), False, Mock(), Mock(), Mock(), Mock()
+        )
+
+        apply_control_commands.assert_not_called()
+        self.assertFalse(should_stop)
 
 
 class NotificationFlagTests(unittest.TestCase):
