@@ -217,6 +217,32 @@ class StateStore:
             for row in rows
         ]
 
+    def get_risk_events_since(self, cutoff_iso: str, limit: int = 500) -> list[RiskEvent]:
+        """All risk/transition events with created_at >= cutoff_iso (an
+        isoformat() string in this store's configured timezone), newest
+        first, capped at `limit` rows as a safety net against unbounded
+        history. Used by the /ask AI assistant to see the full recent
+        transition history instead of just the last N events."""
+        rows = self.conn.execute(
+            """
+            SELECT event_type, symbol, details, created_at
+            FROM risk_events
+            WHERE created_at >= ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (cutoff_iso, limit),
+        ).fetchall()
+        return [
+            RiskEvent(
+                event_type=str(row["event_type"]),
+                symbol=row["symbol"],
+                details=str(row["details"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        ]
+
     def record_equity_snapshot(self, equity_usdt: float) -> None:
         now = datetime.now(self.tz).isoformat()
         day_key = self.get_day_key()

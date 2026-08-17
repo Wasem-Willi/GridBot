@@ -198,6 +198,7 @@ Env keys:
 - `AI_TIMEOUT_SECONDS` (default `2`)
 - `AI_RECOMPUTE_SECONDS` (default `300`)
 - `AI_CHAT_TIMEOUT_SECONDS` (default `20`) - timeout for the `/ask` command below
+- `AI_CHAT_HISTORY_DAYS` (default `2`) - how many days of transition/risk-event history `/ask` includes in its context
 
 ### Ask the AI assistant (`/ask`)
 
@@ -205,14 +206,15 @@ Independent of `AI_FILTER_MODE`, send `/ask <question>` in Telegram to get a
 free-text answer from the same OpenAI model (`AI_MODEL`), reusing the
 `OPENAI_API_KEY`. Every question is sent along with a live "bot context"
 snapshot pulled fresh from the store at the moment of the question: current
-bot status (running/halted), a P/L snapshot, and the most recent
-transition/risk events (the same data behind `/status`, `/pnl`, and
-`/transitions`) - so it can answer questions like "is the bot running?" or
-"what happened recently?" directly instead of guessing. It still has no
-access to specific open orders or per-symbol grid levels, and never places
-orders or changes bot behavior - it's a read-only Q&A helper. If
-`OPENAI_API_KEY` is not set, `/ask` replies that AI chat isn't configured
-instead of failing silently.
+bot status (running/halted), a P/L snapshot, and the **full** transition/risk
+event history for the last `AI_CHAT_HISTORY_DAYS` days (default 2, capped at
+500 events as a safety net) - not just the last few events shown by
+`/transitions`. This lets it answer "what happened over the last couple of
+days?" style questions directly instead of only seeing a fixed last-10
+window. It still has no access to specific open orders or per-symbol grid
+levels, and never places orders or changes bot behavior - it's a read-only
+Q&A helper. If `OPENAI_API_KEY` is not set, `/ask` replies that AI chat isn't
+configured instead of failing silently.
 
 ## 8) Current v1 scope notes
 

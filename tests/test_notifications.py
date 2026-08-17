@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import ANY, Mock, patch
+from zoneinfo import ZoneInfo
 
 from gridbot.alerts import ControlCommand
 from gridbot.main import (
@@ -12,6 +13,7 @@ from gridbot.main import (
     RegimeController,
     _apply_control_commands,
     _build_ai_ask_context,
+    _build_ai_ask_transitions_text,
     _build_notify_status_text,
     _handle_order_placement_error,
     _make_ai_ask_provider,
@@ -169,12 +171,13 @@ class ApplyControlCommandsNotifyTests(unittest.TestCase):
 
 class ApplyControlCommandsAskTests(unittest.TestCase):
     def _run(self, store: Mock, alerter: Mock, ai_ask_provider: Mock, commands: list[ControlCommand]) -> None:
-        store.get_recent_risk_events.return_value = []
+        store.tz = ZoneInfo("UTC")
+        store.get_risk_events_since.return_value = []
         alerter.poll_commands.return_value = (commands, 1)
         _apply_control_commands(
             alerter,
             store,
-            Mock(),
+            Mock(ai_chat_history_days=2),
             False,
             Mock(return_value=""),
             Mock(return_value=""),
@@ -228,10 +231,11 @@ class ApplyControlCommandsAskTests(unittest.TestCase):
 class BuildAiAskContextTests(unittest.TestCase):
     def test_includes_status_pnl_and_transitions(self) -> None:
         store = _store()
+        store.tz = ZoneInfo("UTC")
         event = Mock(created_at="2026-08-17T12:00:00", event_type="band_liquidation", symbol="BTCUSDT", details={"band": "stop_loss"})
-        store.get_recent_risk_events.return_value = [event]
+        store.get_risk_events_since.return_value = [event]
 
-        context = _build_ai_ask_context(store, False, Mock(return_value="P/L: +1.23 USDT"))
+        context = _build_ai_ask_context(store, False, Mock(return_value="P/L: +1.23 USDT"), 2)
 
         self.assertIn("Bot status: RUNNING", context)
         self.assertIn("P/L: +1.23 USDT", context)
@@ -240,23 +244,87 @@ class BuildAiAskContextTests(unittest.TestCase):
 
     def test_reports_halted_status(self) -> None:
         store = _store()
-        store.get_recent_risk_events.return_value = []
+        store.tz = ZoneInfo("UTC")
+        store.get_risk_events_since.return_value = []
 
-        context = _build_ai_ask_context(store, True, Mock(return_value=""))
+        context = _build_ai_ask_context(store, True, Mock(return_value=""), 2)
 
         self.assertIn("Bot status: STOPPED", context)
 
     def test_pnl_provider_failure_is_reported_instead_of_raising(self) -> None:
         store = _store()
-        store.get_recent_risk_events.return_value = []
+        store.tz = ZoneInfo("UTC")
+        store.get_risk_events_since.return_value = []
 
         def _failing_pnl() -> str:
             raise ValueError("exchange unreachable")
 
-        context = _build_ai_ask_context(store, False, _failing_pnl)
+        context = _build_ai_ask_context(store, False, _failing_pnl, 2)
 
         self.assertIn("P/L snapshot unavailable", context)
         self.assertIn("exchange unreachable", context)
+
+    def test_uses_configured_history_days_window(self) -> None:
+        store = _store()
+        store.tz = ZoneInfo("UTC")
+        store.get_risk_events_since.return_value = []
+
+        context = _build_ai_ask_context(store, False, Mock(return_value=""), 5)
+
+        store.get_risk_events_since.assert_called_once()
+        self.assertIn("last 5 day(s)", context)
+
+
+class BuildAiAskTransitionsTextTests(unittest.TestCase):
+    def test_no_events_reports_empty_window(self) -> None:
+        store = _store()
+        store.tz = ZoneInfo("UTC")
+        store.get_risk_events_since.return_value = []
+
+        text = _build_ai_ask_transitions_text(store, 2)
+
+        self.assertEqual(text, "No transition/risk events recorded in the last 2 day(s).")
+
+    def test_queries_with_cutoff_two_days_before_now(self) -> None:
+        store = _store()
+        store.tz = ZoneInfo("UTC")
+        store.get_risk_events_since.return_value = []
+
+        before = datetime.now(ZoneInfo("UTC")) - timedelta(days=2)
+        _build_ai_ask_transitions_text(store, 2)
+        after = datetime.now(ZoneInfo("UTC")) - timedelta(days=2)
+
+        cutoff_arg = store.get_risk_events_since.call_args.args[0]
+        cutoff_dt = datetime.fromisoformat(cutoff_arg)
+        self.assertTrue(before - timedelta(seconds=5) <= cutoff_dt <= after + timedelta(seconds=5))
+
+    def test_includes_all_events_and_count(self) -> None:
+        store = _store()
+        store.tz = ZoneInfo("UTC")
+        events = [
+            Mock(created_at="2026-08-17T12:00:00", event_type="band_liquidation", symbol="BTCUSDT", details={"band": "stop_loss"}),
+            Mock(created_at="2026-08-16T09:00:00", event_type="ai_pause", symbol="ETHUSDT", details={}),
+        ]
+        store.get_risk_events_since.return_value = events
+
+        text = _build_ai_ask_transitions_text(store, 2)
+
+        self.assertIn("2 events", text)
+        self.assertIn("band_liquidation", text)
+        self.assertIn("BTCUSDT", text)
+        self.assertIn("ai_pause", text)
+        self.assertIn("ETHUSDT", text)
+
+    def test_global_symbol_none_rendered_as_global(self) -> None:
+        store = _store()
+        store.tz = ZoneInfo("UTC")
+        store.get_risk_events_since.return_value = [
+            Mock(created_at="2026-08-17T12:00:00", event_type="manual_kill", symbol=None, details={"source": "telegram"}),
+        ]
+
+        text = _build_ai_ask_transitions_text(store, 2)
+
+        self.assertIn("GLOBAL", text)
 
 
 class MakeAiAskProviderTests(unittest.TestCase):

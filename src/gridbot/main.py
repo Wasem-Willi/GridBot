@@ -194,7 +194,7 @@ def _apply_control_commands(
             if not question:
                 alerter.send("Usage: /ask <question>")
             else:
-                context = _build_ai_ask_context(store, bot_halted, pnl_provider)
+                context = _build_ai_ask_context(store, bot_halted, pnl_provider, cfg.ai_chat_history_days)
                 try:
                     answer = ai_ask_provider(question, context)
                     success = True
@@ -462,13 +462,14 @@ def _make_start_fresh_provider(
 _AI_CHAT_SYSTEM_PROMPT = (
     "You are GridBot's AI assistant, reachable by the bot operator via Telegram /ask. "
     "GridBot is a rule-based Binance spot grid trading bot. Each question is accompanied by "
-    "a 'Bot context' block containing the live bot status, a P/L snapshot, and the most "
-    "recent risk/transition events, all pulled directly from the bot at the moment of the "
-    "question - use that data to answer status/P&L/event questions accurately instead of "
-    "guessing. If the operator asks about something not covered by the context (e.g. "
-    "specific open orders or per-symbol grid levels), say so plainly and suggest /status, "
-    "/pnl, or /transitions for more detail rather than inventing an answer. Answer clearly "
-    "and concisely."
+    "a 'Bot context' block containing the live bot status, a P/L snapshot, and the full "
+    "transition/risk-event history for a recent multi-day window (stated in the context "
+    "itself), all pulled directly from the bot at the moment of the question - use that data "
+    "to answer status/P&L/event/history questions accurately instead of guessing. If the "
+    "operator asks about something not covered by the context (e.g. specific open orders or "
+    "per-symbol grid levels, or events older than the stated window), say so plainly and "
+    "suggest /status, /pnl, or /transitions for more detail rather than inventing an answer. "
+    "Answer clearly and concisely."
 )
 
 
@@ -476,10 +477,13 @@ def _build_ai_ask_context(
     store: StateStore,
     bot_halted: bool,
     pnl_provider: Callable[[], str],
+    history_days: int,
 ) -> str:
     """Snapshot of live bot data handed to the AI assistant alongside the
     operator's /ask question, so answers are grounded in the bot's actual
-    current state rather than guessed."""
+    current state rather than guessed. Includes the full transition/risk
+    history over `history_days` (not just the last handful of events), so
+    the assistant can answer "check the whole history" style questions."""
     try:
         pnl_text = pnl_provider()
     except (requests.RequestException, ValueError) as error:
@@ -488,7 +492,7 @@ def _build_ai_ask_context(
     return (
         f"Bot status: {status}\n"
         f"{pnl_text}\n\n"
-        f"{_build_transitions_text(store)}"
+        f"{_build_ai_ask_transitions_text(store, history_days)}"
     )
 
 
@@ -536,6 +540,28 @@ def _build_transitions_text(store: StateStore, limit: int = 10) -> str:
     for event in events:
         symbol = event.symbol if event.symbol is not None else "GLOBAL"
         lines.append(f"{event.created_at} | {event.event_type} | {symbol} | {event.details}")
+    return "\n".join(lines)
+
+
+_AI_ASK_TRANSITIONS_MAX_EVENTS = 500
+
+
+def _build_ai_ask_transitions_text(store: StateStore, history_days: int) -> str:
+    """Full transition/risk-event history for the last `history_days` days,
+    for the /ask AI assistant. Unlike _build_transitions_text (a fixed
+    last-10 lookup used by /transitions), this is time-bounded so the
+    assistant can actually see "the whole history" over the configured
+    window rather than only the most recent handful of events."""
+    cutoff = (datetime.now(store.tz) - timedelta(days=history_days)).isoformat()
+    events = store.get_risk_events_since(cutoff, limit=_AI_ASK_TRANSITIONS_MAX_EVENTS)
+    if not events:
+        return f"No transition/risk events recorded in the last {history_days} day(s)."
+    lines = [f"Transition/risk events, last {history_days} day(s), newest first ({len(events)} events):"]
+    for event in events:
+        symbol = event.symbol if event.symbol is not None else "GLOBAL"
+        lines.append(f"{event.created_at} | {event.event_type} | {symbol} | {event.details}")
+    if len(events) >= _AI_ASK_TRANSITIONS_MAX_EVENTS:
+        lines.append(f"(truncated at {_AI_ASK_TRANSITIONS_MAX_EVENTS} most recent events)")
     return "\n".join(lines)
 
 
