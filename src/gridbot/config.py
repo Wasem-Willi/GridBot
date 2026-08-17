@@ -83,6 +83,7 @@ class BotConfig:
     ai_prompt_path: Path
     ai_timeout_seconds: int
     ai_recompute_seconds: int
+    ai_chat_timeout_seconds: int
     binance_base_url: str
     timezone_name: str
     db_path: Path
@@ -177,6 +178,9 @@ def load_config() -> BotConfig:
     ai_recompute_seconds = int(_get_env("AI_RECOMPUTE_SECONDS", "300"))
     if ai_recompute_seconds < 1:
         raise ValueError("AI_RECOMPUTE_SECONDS must be >= 1")
+    ai_chat_timeout_seconds = int(_get_env("AI_CHAT_TIMEOUT_SECONDS", "20"))
+    if ai_chat_timeout_seconds < 1:
+        raise ValueError("AI_CHAT_TIMEOUT_SECONDS must be >= 1")
 
     return BotConfig(
         mode=mode,
@@ -219,6 +223,7 @@ def load_config() -> BotConfig:
         ai_prompt_path=ai_prompt_path,
         ai_timeout_seconds=ai_timeout_seconds,
         ai_recompute_seconds=ai_recompute_seconds,
+        ai_chat_timeout_seconds=ai_chat_timeout_seconds,
         binance_base_url=base_url,
         timezone_name=_get_env("TIMEZONE", "Asia/Jerusalem"),
         db_path=Path(_get_env("DB_PATH", "data/gridbot.db")),

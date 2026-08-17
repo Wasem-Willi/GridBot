@@ -125,3 +125,36 @@ class OpenAIDecisionClient:
         if not reason:
             reason = "no_reason_provided"
         return AIDecision(action=action, confidence=confidence, reason=reason)
+
+
+def ask_freeform(api_key: str, model: str, timeout_seconds: int, system_prompt: str, question: str) -> str:
+    """Send a freeform question to the OpenAI Responses API and return the
+    plain-text answer. Unlike OpenAIDecisionClient.decide, the response is
+    not constrained to a JSON schema, so this is used for interactive
+    chat (e.g. a Telegram /ask command) rather than bot decisions."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model,
+        "instructions": system_prompt,
+        "input": question,
+    }
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers=headers,
+        json=body,
+        timeout=timeout_seconds,
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as error:
+        raise ValueError(
+            f"OpenAI request failed (status={response.status_code}): "
+            f"{_openai_error_message(response)}"
+        ) from error
+    result = response.json()
+    if not isinstance(result, dict):
+        raise ValueError("OpenAI response must be an object")
+    return _response_output_text(result).strip()

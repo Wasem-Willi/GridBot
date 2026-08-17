@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import UTC, datetime
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock, patch
 
 from gridbot.alerts import ControlCommand
 from gridbot.main import (
@@ -13,6 +13,7 @@ from gridbot.main import (
     _apply_control_commands,
     _build_notify_status_text,
     _handle_order_placement_error,
+    _make_ai_ask_provider,
     _notify_enabled,
     _refresh_symbols,
 )
@@ -78,6 +79,7 @@ class ApplyControlCommandsNotifyTests(unittest.TestCase):
             Mock(return_value=""),
             Mock(return_value=""),
             Mock(return_value=(True, "")),
+            Mock(return_value=""),
         )
 
     def test_notify_status_command_sends_status_text(self) -> None:
@@ -161,6 +163,92 @@ class ApplyControlCommandsNotifyTests(unittest.TestCase):
 
         for category in NOTIFICATION_CATEGORIES:
             store.set_state.assert_any_call(f"notify_{category}", "0")
+
+
+class ApplyControlCommandsAskTests(unittest.TestCase):
+    def _run(self, store: Mock, alerter: Mock, ai_ask_provider: Mock, commands: list[ControlCommand]) -> None:
+        alerter.poll_commands.return_value = (commands, 1)
+        _apply_control_commands(
+            alerter,
+            store,
+            Mock(),
+            False,
+            Mock(return_value=""),
+            Mock(return_value=""),
+            Mock(return_value=(True, "")),
+            ai_ask_provider,
+        )
+
+    def test_ask_with_question_sends_provider_answer_and_logs_event(self) -> None:
+        store = _store()
+        alerter = Mock()
+        ai_ask_provider = Mock(return_value="42 is the answer.")
+
+        self._run(store, alerter, ai_ask_provider, [ControlCommand(name="ask", arg="What is the meaning of life?")])
+
+        ai_ask_provider.assert_called_once_with("What is the meaning of life?")
+        alerter.send.assert_called_once_with("42 is the answer.")
+        store.log_risk_event.assert_called_once_with(
+            "ai_chat",
+            None,
+            {"question": "What is the meaning of life?", "success": 1, "source": "telegram"},
+        )
+
+    def test_ask_without_question_shows_usage_and_does_not_call_provider(self) -> None:
+        store = _store()
+        alerter = Mock()
+        ai_ask_provider = Mock()
+
+        self._run(store, alerter, ai_ask_provider, [ControlCommand(name="ask", arg="")])
+
+        ai_ask_provider.assert_not_called()
+        alerter.send.assert_called_once_with("Usage: /ask <question>")
+        store.log_risk_event.assert_not_called()
+
+    def test_ask_provider_failure_sends_error_message(self) -> None:
+        store = _store()
+        alerter = Mock()
+        ai_ask_provider = Mock(side_effect=ValueError("OpenAI request failed (status=401): invalid api key"))
+
+        self._run(store, alerter, ai_ask_provider, [ControlCommand(name="ask", arg="hello")])
+
+        alerter.send.assert_called_once_with(
+            "AI chat failed: OpenAI request failed (status=401): invalid api key"
+        )
+        store.log_risk_event.assert_called_once_with(
+            "ai_chat",
+            None,
+            {"question": "hello", "success": 0, "source": "telegram"},
+        )
+
+
+class MakeAiAskProviderTests(unittest.TestCase):
+    def test_missing_api_key_returns_not_configured_message_without_calling_openai(self) -> None:
+        cfg = Mock(ai_api_key="", ai_model="gpt-4o-mini", ai_chat_timeout_seconds=20)
+
+        provider = _make_ai_ask_provider(cfg)
+
+        self.assertEqual(
+            provider("anything"),
+            "AI chat is not configured: set OPENAI_API_KEY in .env to enable /ask.",
+        )
+
+    @patch("gridbot.main.ask_freeform")
+    def test_forwards_question_to_ask_freeform_with_cfg_settings(self, ask_freeform: Mock) -> None:
+        ask_freeform.return_value = "Grid trading works best in ranging markets."
+        cfg = Mock(ai_api_key="sk-test", ai_model="gpt-4o-mini", ai_chat_timeout_seconds=20)
+
+        provider = _make_ai_ask_provider(cfg)
+        answer = provider("How does grid trading work?")
+
+        self.assertEqual(answer, "Grid trading works best in ranging markets.")
+        ask_freeform.assert_called_once_with(
+            "sk-test",
+            "gpt-4o-mini",
+            20,
+            ANY,
+            "How does grid trading work?",
+        )
 
 
 class NotificationFlagTests(unittest.TestCase):

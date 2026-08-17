@@ -16,6 +16,7 @@ from gridbot.ai_filter import (
     AI_ACTION_PAUSE,
     AI_ACTION_SELL_ONLY,
     OpenAIDecisionClient,
+    ask_freeform,
 )
 from gridbot.config import BotConfig, load_config
 from gridbot.exchange import (
@@ -101,6 +102,7 @@ def _apply_control_commands(
     pnl_provider: Callable[[], str],
     cancel_all_provider: Callable[[], str],
     start_fresh_provider: Callable[[], tuple[bool, str]],
+    ai_ask_provider: Callable[[str], str],
 ) -> tuple[bool, bool]:
     offset_raw = store.get_state("telegram_offset")
     offset = int(offset_raw) if offset_raw is not None else 0
@@ -186,6 +188,23 @@ def _apply_control_commands(
                     "notify_toggle",
                     None,
                     {"category": category, "enabled": 1 if enabled else 0, "source": "telegram"},
+                )
+        elif command.name == "ask":
+            question = (command.arg or "").strip()
+            if not question:
+                alerter.send("Usage: /ask <question>")
+            else:
+                try:
+                    answer = ai_ask_provider(question)
+                    success = True
+                except (requests.RequestException, ValueError) as error:
+                    answer = f"AI chat failed: {error}"
+                    success = False
+                alerter.send(answer)
+                store.log_risk_event(
+                    "ai_chat",
+                    None,
+                    {"question": question, "success": 1 if success else 0, "source": "telegram"},
                 )
     return bot_halted, should_stop
 
@@ -327,6 +346,7 @@ def _responsive_wait(
     pnl_provider: Callable[[], str],
     cancel_all_provider: Callable[[], str],
     start_fresh_provider: Callable[[], tuple[bool, str]],
+    ai_ask_provider: Callable[[str], str],
 ) -> tuple[bool, bool]:
     remaining = max(wait_seconds, 0)
     step = max(poll_seconds, 1)
@@ -342,6 +362,7 @@ def _responsive_wait(
             pnl_provider,
             cancel_all_provider,
             start_fresh_provider,
+            ai_ask_provider,
         )
         store.set_state("bot_halted", "1" if bot_halted else "0")
         if should_stop:
@@ -437,6 +458,32 @@ def _make_start_fresh_provider(
     return _provider
 
 
+_AI_CHAT_SYSTEM_PROMPT = (
+    "You are GridBot's AI assistant, reachable by the bot operator via Telegram /ask. "
+    "GridBot is a rule-based Binance spot grid trading bot; you do not control it and have "
+    "no live market data, balances, or order state beyond what the operator tells you in "
+    "their question. Answer clearly and concisely. If asked about live prices, balances, "
+    "P/L, or bot status, tell the operator to use /status, /pnl, or /transitions instead of "
+    "guessing."
+)
+
+
+def _make_ai_ask_provider(cfg: BotConfig) -> Callable[[str], str]:
+    if not cfg.ai_api_key:
+        return lambda _question: "AI chat is not configured: set OPENAI_API_KEY in .env to enable /ask."
+
+    def _provider(question: str) -> str:
+        return ask_freeform(
+            cfg.ai_api_key,
+            cfg.ai_model,
+            cfg.ai_chat_timeout_seconds,
+            _AI_CHAT_SYSTEM_PROMPT,
+            question,
+        )
+
+    return _provider
+
+
 def _build_help_text() -> str:
     return (
         "GridBot commands:\n"
@@ -451,7 +498,8 @@ def _build_help_text() -> str:
         "/stop - stop bot process\n"
         "/notify - show live notification toggle status\n"
         "/notify_on <category|all> - turn a notification category (or all) on\n"
-        "/notify_off <category|all> - turn a notification category (or all) off"
+        "/notify_off <category|all> - turn a notification category (or all) off\n"
+        "/ask <question> - ask the AI assistant a question"
     )
 
 
@@ -786,6 +834,7 @@ def run() -> None:
     pnl_provider = _make_pnl_provider(cfg, exchange, store)
     cancel_all_provider = _make_cancel_all_provider(cfg, exchange)
     start_fresh_provider = _make_start_fresh_provider(cfg, exchange, store)
+    ai_ask_provider = _make_ai_ask_provider(cfg)
     regime = RegimeController(cfg, exchange, store, alerter)
     ai_filter = AIFilterController(cfg, store, alerter)
     logging.info("Regime filter mode=%s", cfg.regime_filter_mode)
@@ -830,6 +879,7 @@ def run() -> None:
                 pnl_provider,
                 cancel_all_provider,
                 start_fresh_provider,
+                ai_ask_provider,
             )
             if should_stop:
                 break
@@ -919,6 +969,7 @@ def run() -> None:
                     pnl_provider,
                     cancel_all_provider,
                     start_fresh_provider,
+                    ai_ask_provider,
                 )
                 if should_stop:
                     break
@@ -933,6 +984,7 @@ def run() -> None:
                     pnl_provider,
                     cancel_all_provider,
                     start_fresh_provider,
+                    ai_ask_provider,
                 )
                 if cfg.reconciliation_enabled and bot_halted and not cfg.dry_run:
                     clean_cycles, resume_block_active = _load_reconciliation_gate_state(
@@ -1241,6 +1293,7 @@ def run() -> None:
                 pnl_provider,
                 cancel_all_provider,
                 start_fresh_provider,
+                ai_ask_provider,
             )
             if should_stop:
                 break

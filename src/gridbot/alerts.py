@@ -66,6 +66,8 @@ class TelegramAlerter:
                 commands.append(ControlCommand(name="notify_on", arg=text[len("/notify_on"):].strip()))
             elif text.startswith("/notify_off"):
                 commands.append(ControlCommand(name="notify_off", arg=text[len("/notify_off"):].strip()))
+            elif text.startswith("/ask"):
+                commands.append(ControlCommand(name="ask", arg=text[len("/ask"):].strip()))
             else:
                 logging.info("Ignoring Telegram command text=%s", text)
         return commands, next_offset

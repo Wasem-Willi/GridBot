@@ -44,6 +44,16 @@ class PollCommandsNotifyParsingTests(unittest.TestCase):
         commands, _ = alerter.poll_commands(0)
         self.assertEqual(commands, [ControlCommand(name="notify_on", arg="")])
 
+    def test_ask_with_question_arg(self) -> None:
+        alerter = _alerter_with_response(["/ask what is the current regime?"])
+        commands, _ = alerter.poll_commands(0)
+        self.assertEqual(commands, [ControlCommand(name="ask", arg="what is the current regime?")])
+
+    def test_ask_without_question_has_empty_arg(self) -> None:
+        alerter = _alerter_with_response(["/ask"])
+        commands, _ = alerter.poll_commands(0)
+        self.assertEqual(commands, [ControlCommand(name="ask", arg="")])
+
 
 if __name__ == "__main__":
     unittest.main()
