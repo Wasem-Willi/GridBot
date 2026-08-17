@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import UTC, datetime, timedelta
 from unittest.mock import ANY, Mock, patch
@@ -12,14 +13,16 @@ from gridbot.main import (
     OrderPlacementError,
     RegimeController,
     _apply_control_commands,
-    _build_ai_ask_context,
     _build_ai_ask_transitions_text,
     _build_notify_status_text,
     _handle_order_placement_error,
-    _make_ai_ask_provider,
+    _load_ai_conversation,
+    _make_ai_agent_provider,
+    _make_ai_tool_executor,
     _notify_enabled,
     _refresh_symbols,
     _responsive_wait,
+    _save_ai_conversation,
 )
 
 
@@ -171,8 +174,6 @@ class ApplyControlCommandsNotifyTests(unittest.TestCase):
 
 class ApplyControlCommandsAskTests(unittest.TestCase):
     def _run(self, store: Mock, alerter: Mock, ai_ask_provider: Mock, commands: list[ControlCommand]) -> None:
-        store.tz = ZoneInfo("UTC")
-        store.get_risk_events_since.return_value = []
         alerter.poll_commands.return_value = (commands, 1)
         _apply_control_commands(
             alerter,
@@ -188,17 +189,37 @@ class ApplyControlCommandsAskTests(unittest.TestCase):
     def test_ask_with_question_sends_provider_answer_and_logs_event(self) -> None:
         store = _store()
         alerter = Mock()
-        ai_ask_provider = Mock(return_value="42 is the answer.")
+        ai_ask_provider = Mock(return_value=("42 is the answer.", [{"type": "message"}]))
 
         self._run(store, alerter, ai_ask_provider, [ControlCommand(name="ask", arg="What is the meaning of life?")])
 
-        ai_ask_provider.assert_called_once_with("What is the meaning of life?", ANY)
+        ai_ask_provider.assert_called_once_with("What is the meaning of life?", [])
         alerter.send.assert_called_once_with("42 is the answer.")
         store.log_risk_event.assert_called_once_with(
             "ai_chat",
             None,
             {"question": "What is the meaning of life?", "success": 1, "source": "telegram"},
         )
+
+    def test_ask_persists_new_turn_to_conversation_state(self) -> None:
+        store = _store()
+        alerter = Mock()
+        new_turn = [{"role": "user", "content": "hi"}, {"type": "message"}]
+        ai_ask_provider = Mock(return_value=("hello!", new_turn))
+
+        self._run(store, alerter, ai_ask_provider, [ControlCommand(name="ask", arg="hi")])
+
+        store.set_state.assert_any_call("ai_conversation", json.dumps([new_turn]))
+
+    def test_ask_passes_prior_conversation_turns_to_provider(self) -> None:
+        prior_turn = [{"role": "user", "content": "earlier question"}, {"type": "message"}]
+        store = _store({"ai_conversation": json.dumps([prior_turn])})
+        alerter = Mock()
+        ai_ask_provider = Mock(return_value=("answer", [{"type": "message"}]))
+
+        self._run(store, alerter, ai_ask_provider, [ControlCommand(name="ask", arg="follow up")])
+
+        ai_ask_provider.assert_called_once_with("follow up", [prior_turn])
 
     def test_ask_without_question_shows_usage_and_does_not_call_provider(self) -> None:
         store = _store()
@@ -211,7 +232,7 @@ class ApplyControlCommandsAskTests(unittest.TestCase):
         alerter.send.assert_called_once_with("Usage: /ask <question>")
         store.log_risk_event.assert_not_called()
 
-    def test_ask_provider_failure_sends_error_message(self) -> None:
+    def test_ask_provider_failure_sends_error_message_and_does_not_persist_conversation(self) -> None:
         store = _store()
         alerter = Mock()
         ai_ask_provider = Mock(side_effect=ValueError("OpenAI request failed (status=401): invalid api key"))
@@ -226,56 +247,339 @@ class ApplyControlCommandsAskTests(unittest.TestCase):
             None,
             {"question": "hello", "success": 0, "source": "telegram"},
         )
+        for call in store.set_state.call_args_list:
+            self.assertNotEqual(call.args[0], "ai_conversation")
+
+    def test_resyncs_bot_halted_after_action_tool_writes_to_store(self) -> None:
+        """kill_bot/resume_bot tools write bot_halted directly to the store;
+        _apply_control_commands must resync its local bot_halted afterward so
+        the main loop doesn't clobber it on the next store.set_state write."""
+        state: dict[str, str] = {}
+        store = Mock()
+        store.get_state.side_effect = lambda key: state.get(key)
+        store.set_state.side_effect = lambda key, value: state.__setitem__(key, value)
+        alerter = Mock()
+        alerter.poll_commands.return_value = ([ControlCommand(name="ask", arg="please kill the bot")], 1)
+
+        def _provider(question: str, prior_turns: list) -> tuple[str, list]:
+            state["bot_halted"] = "1"  # simulate the kill_bot tool executing
+            return "Bot halted.", [{"type": "message"}]
+
+        bot_halted, _should_stop = _apply_control_commands(
+            alerter,
+            store,
+            Mock(ai_chat_history_days=2),
+            False,
+            Mock(return_value=""),
+            Mock(return_value=""),
+            Mock(return_value=(True, "")),
+            _provider,
+        )
+
+        self.assertTrue(bot_halted)
 
 
-class BuildAiAskContextTests(unittest.TestCase):
-    def test_includes_status_pnl_and_transitions(self) -> None:
+class AskResetCommandTests(unittest.TestCase):
+    def test_clears_conversation_state_and_confirms(self) -> None:
+        store = _store({"ai_conversation": json.dumps([[{"role": "user", "content": "old"}]])})
+        alerter = Mock()
+        alerter.poll_commands.return_value = ([ControlCommand(name="ask_reset")], 1)
+
+        _apply_control_commands(
+            alerter,
+            store,
+            Mock(ai_chat_history_days=2),
+            False,
+            Mock(return_value=""),
+            Mock(return_value=""),
+            Mock(return_value=(True, "")),
+            Mock(),
+        )
+
+        store.set_state.assert_any_call("ai_conversation", json.dumps([]))
+        alerter.send.assert_called_once_with("AI assistant conversation memory cleared.")
+        store.log_risk_event.assert_called_once_with("ai_chat_reset", None, {"source": "telegram"})
+
+
+class LoadSaveAiConversationTests(unittest.TestCase):
+    def test_load_returns_empty_list_when_no_state_saved(self) -> None:
         store = _store()
-        store.tz = ZoneInfo("UTC")
-        event = Mock(created_at="2026-08-17T12:00:00", event_type="band_liquidation", symbol="BTCUSDT", details={"band": "stop_loss"})
-        store.get_risk_events_since.return_value = [event]
 
-        context = _build_ai_ask_context(store, False, Mock(return_value="P/L: +1.23 USDT"), 2)
+        self.assertEqual(_load_ai_conversation(store), [])
 
-        self.assertIn("Bot status: RUNNING", context)
-        self.assertIn("P/L: +1.23 USDT", context)
-        self.assertIn("band_liquidation", context)
-        self.assertIn("BTCUSDT", context)
+    def test_load_returns_empty_list_on_malformed_json(self) -> None:
+        store = _store({"ai_conversation": "not-json"})
 
-    def test_reports_halted_status(self) -> None:
+        self.assertEqual(_load_ai_conversation(store), [])
+
+    def test_load_returns_empty_list_when_saved_value_is_not_a_list(self) -> None:
+        store = _store({"ai_conversation": json.dumps({"not": "a list"})})
+
+        self.assertEqual(_load_ai_conversation(store), [])
+
+    def test_save_then_load_round_trips(self) -> None:
+        store = _store()
+        turns = [[{"role": "user", "content": "hi"}], [{"role": "user", "content": "again"}]]
+
+        _save_ai_conversation(store, turns)
+        saved_json = store.set_state.call_args.args[1]
+        store2 = _store({"ai_conversation": saved_json})
+
+        self.assertEqual(_load_ai_conversation(store2), turns)
+
+    def test_save_trims_to_max_turns(self) -> None:
+        store = _store()
+        turns = [[{"n": i}] for i in range(10)]
+
+        _save_ai_conversation(store, turns)
+
+        saved_json = store.set_state.call_args.args[1]
+        saved_turns = json.loads(saved_json)
+        self.assertEqual(len(saved_turns), 6)
+        self.assertEqual(saved_turns, turns[-6:])
+
+
+class MakeAiToolExecutorTests(unittest.TestCase):
+    def _executor(
+        self,
+        cfg: Mock | None = None,
+        exchange: Mock | None = None,
+        store: Mock | None = None,
+        pnl_provider: Mock | None = None,
+        cancel_all_provider: Mock | None = None,
+    ):
+        cfg = cfg if cfg is not None else Mock(dry_run=True, mode="paper", ai_chat_history_days=2)
+        exchange = exchange if exchange is not None else Mock()
+        store = store if store is not None else _store()
+        pnl_provider = pnl_provider if pnl_provider is not None else Mock(return_value="P/L: +1.0 USDT")
+        cancel_all_provider = cancel_all_provider if cancel_all_provider is not None else Mock(return_value="canceled")
+        return _make_ai_tool_executor(cfg, exchange, store, pnl_provider, cancel_all_provider), store
+
+    def test_get_bot_status_reports_running_and_mode(self) -> None:
+        executor, _store_ = self._executor(cfg=Mock(dry_run=True, mode="paper", ai_chat_history_days=2))
+
+        result = json.loads(executor("get_bot_status", {}))
+
+        self.assertEqual(result, {"status": "RUNNING", "mode": "paper"})
+
+    def test_get_bot_status_reports_stopped_when_halted(self) -> None:
+        store = _store({"bot_halted": "1"})
+        executor, _ = self._executor(store=store)
+
+        result = json.loads(executor("get_bot_status", {}))
+
+        self.assertEqual(result["status"], "STOPPED")
+
+    def test_get_pnl_snapshot_delegates_to_provider(self) -> None:
+        executor, _ = self._executor(pnl_provider=Mock(return_value="P/L: +5 USDT"))
+
+        self.assertEqual(executor("get_pnl_snapshot", {}), "P/L: +5 USDT")
+
+    def test_get_transitions_uses_given_days(self) -> None:
         store = _store()
         store.tz = ZoneInfo("UTC")
         store.get_risk_events_since.return_value = []
+        executor, _ = self._executor(store=store)
 
-        context = _build_ai_ask_context(store, True, Mock(return_value=""), 2)
+        result = executor("get_transitions", {"days": 7})
 
-        self.assertIn("Bot status: STOPPED", context)
+        self.assertIn("last 7 day(s)", result)
 
-    def test_pnl_provider_failure_is_reported_instead_of_raising(self) -> None:
+    def test_get_transitions_defaults_to_cfg_history_days_when_omitted(self) -> None:
         store = _store()
         store.tz = ZoneInfo("UTC")
         store.get_risk_events_since.return_value = []
+        executor, _ = self._executor(cfg=Mock(dry_run=True, mode="paper", ai_chat_history_days=3), store=store)
 
-        def _failing_pnl() -> str:
-            raise ValueError("exchange unreachable")
+        result = executor("get_transitions", {})
 
-        context = _build_ai_ask_context(store, False, _failing_pnl, 2)
+        self.assertIn("last 3 day(s)", result)
 
-        self.assertIn("P/L snapshot unavailable", context)
-        self.assertIn("exchange unreachable", context)
+    def test_get_open_orders_reports_paper_mode_without_calling_exchange(self) -> None:
+        exchange = Mock()
+        executor, _ = self._executor(cfg=Mock(dry_run=True, mode="paper", ai_chat_history_days=2), exchange=exchange)
 
-    def test_uses_configured_history_days_window(self) -> None:
+        result = executor("get_open_orders", {})
+
+        self.assertIn("Paper mode", result)
+        exchange.get_all_open_orders.assert_not_called()
+
+    def test_get_open_orders_all_symbols_when_live(self) -> None:
+        exchange = Mock()
+        exchange.get_all_open_orders.return_value = [{"symbol": "BTCUSDT"}]
+        executor, _ = self._executor(cfg=Mock(dry_run=False, mode="live", ai_chat_history_days=2), exchange=exchange)
+
+        result = executor("get_open_orders", {})
+
+        self.assertIn("BTCUSDT", result)
+        exchange.get_all_open_orders.assert_called_once()
+
+    def test_get_open_orders_filters_by_symbol_when_live(self) -> None:
+        exchange = Mock()
+        exchange.get_open_orders.return_value = [{"symbol": "ETHUSDT"}]
+        executor, _ = self._executor(cfg=Mock(dry_run=False, mode="live", ai_chat_history_days=2), exchange=exchange)
+
+        result = executor("get_open_orders", {"symbol": "ETHUSDT"})
+
+        exchange.get_open_orders.assert_called_once_with("ETHUSDT")
+        self.assertIn("ETHUSDT", result)
+
+    def test_get_account_balances_reports_paper_mode_without_calling_exchange(self) -> None:
+        exchange = Mock()
+        executor, _ = self._executor(cfg=Mock(dry_run=True, mode="paper", ai_chat_history_days=2), exchange=exchange)
+
+        result = executor("get_account_balances", {})
+
+        self.assertIn("Paper mode", result)
+        exchange.get_account.assert_not_called()
+
+    def test_get_account_balances_filters_out_zero_balances_when_live(self) -> None:
+        exchange = Mock()
+        exchange.get_account.return_value = {
+            "balances": [
+                {"asset": "BTC", "free": "0.01", "locked": "0"},
+                {"asset": "DUST", "free": "0", "locked": "0"},
+            ]
+        }
+        executor, _ = self._executor(cfg=Mock(dry_run=False, mode="live", ai_chat_history_days=2), exchange=exchange)
+
+        result = executor("get_account_balances", {})
+
+        self.assertIn("BTC", result)
+        self.assertNotIn("DUST", result)
+
+    def test_get_symbol_state_found(self) -> None:
         store = _store()
-        store.tz = ZoneInfo("UTC")
-        store.get_risk_events_since.return_value = []
+        store.get_symbol_state.return_value = Mock(
+            symbol="BTCUSDT",
+            center_price=60000.0,
+            lower_bound=58000.0,
+            upper_bound=62000.0,
+            paused=False,
+            pause_reason=None,
+            updated_at="2026-08-17T12:00:00",
+        )
+        executor, _ = self._executor(store=store)
 
-        context = _build_ai_ask_context(store, False, Mock(return_value=""), 5)
+        result = json.loads(executor("get_symbol_state", {"symbol": "btcusdt"}))
 
-        store.get_risk_events_since.assert_called_once()
-        self.assertIn("last 5 day(s)", context)
+        self.assertEqual(result["symbol"], "BTCUSDT")
+        store.get_symbol_state.assert_called_once_with("BTCUSDT")
+
+    def test_get_symbol_state_not_found(self) -> None:
+        store = _store()
+        store.get_symbol_state.return_value = None
+        executor, _ = self._executor(store=store)
+
+        result = executor("get_symbol_state", {"symbol": "XRPUSDT"})
+
+        self.assertIn("No grid state recorded", result)
+
+    def test_cancel_all_orders_delegates_and_logs_ai_action(self) -> None:
+        store = _store()
+        cancel_all_provider = Mock(return_value="Cancel all result: canceled=2")
+        executor, _ = self._executor(store=store, cancel_all_provider=cancel_all_provider)
+
+        result = executor("cancel_all_orders", {})
+
+        self.assertEqual(result, "Cancel all result: canceled=2")
+        store.log_risk_event.assert_called_once_with(
+            "ai_action", None, {"tool": "cancel_all_orders", "result": "Cancel all result: canceled=2"}
+        )
+
+    def test_kill_bot_sets_state_and_logs(self) -> None:
+        store = _store()
+        executor, _ = self._executor(store=store)
+
+        result = executor("kill_bot", {})
+
+        store.set_state.assert_called_once_with("bot_halted", "1")
+        store.log_risk_event.assert_called_once_with("ai_action", None, {"tool": "kill_bot"})
+        self.assertIn("halted", result.lower())
+
+    def test_resume_bot_sets_state_and_logs(self) -> None:
+        store = _store()
+        executor, _ = self._executor(store=store)
+
+        result = executor("resume_bot", {})
+
+        store.set_state.assert_called_once_with("bot_halted", "0")
+        store.log_risk_event.assert_called_once_with("ai_action", None, {"tool": "resume_bot"})
+        self.assertIn("resumed", result.lower())
+
+    def test_set_notification_valid_category(self) -> None:
+        store = _store()
+        executor, _ = self._executor(store=store)
+
+        result = executor("set_notification", {"category": "liquidation", "enabled": False})
+
+        store.set_state.assert_called_once_with("notify_liquidation", "0")
+        self.assertIn("turned OFF", result)
+
+    def test_set_notification_all_categories(self) -> None:
+        store = _store()
+        executor, _ = self._executor(store=store)
+
+        executor("set_notification", {"category": "all", "enabled": True})
+
+        for category in NOTIFICATION_CATEGORIES:
+            store.set_state.assert_any_call(f"notify_{category}", "1")
+
+    def test_set_notification_unknown_category(self) -> None:
+        executor, _ = self._executor()
+
+        result = executor("set_notification", {"category": "bogus", "enabled": True})
+
+        self.assertIn("Unknown notify category", result)
+
+    def test_unknown_tool_name_returns_message(self) -> None:
+        executor, _ = self._executor()
+
+        result = executor("some_unknown_tool", {})
+
+        self.assertIn("Unknown tool", result)
+
+    def test_tool_exception_is_caught_and_returned_as_error_string(self) -> None:
+        exchange = Mock()
+        exchange.get_all_open_orders.side_effect = ValueError("boom")
+        executor, _ = self._executor(cfg=Mock(dry_run=False, mode="live", ai_chat_history_days=2), exchange=exchange)
+
+        result = executor("get_open_orders", {})
+
+        self.assertIn("Tool 'get_open_orders' failed", result)
+        self.assertIn("boom", result)
 
 
-class BuildAiAskTransitionsTextTests(unittest.TestCase):
+class MakeAiAgentProviderTests(unittest.TestCase):
+    def test_missing_api_key_returns_not_configured_message_without_new_items(self) -> None:
+        cfg = Mock(ai_api_key="", ai_model="gpt-4o-mini", ai_chat_timeout_seconds=20)
+
+        provider = _make_ai_agent_provider(cfg, Mock(), Mock(), Mock(), Mock())
+        answer, new_items = provider("anything", [])
+
+        self.assertEqual(answer, "AI chat is not configured: set OPENAI_API_KEY in .env to enable /ask.")
+        self.assertEqual(new_items, [])
+
+    @patch("gridbot.main.run_agent_turn")
+    def test_forwards_flattened_prior_turns_and_new_question(self, run_agent_turn: Mock) -> None:
+        run_agent_turn.return_value = ("42.", [{"type": "message"}])
+        cfg = Mock(ai_api_key="sk-test", ai_model="gpt-4o-mini", ai_chat_timeout_seconds=20)
+        prior_turns = [[{"role": "user", "content": "q1"}, {"type": "message"}]]
+
+        provider = _make_ai_agent_provider(cfg, Mock(), _store(), Mock(return_value=""), Mock(return_value=""))
+        answer, new_items = provider("q2", prior_turns)
+
+        self.assertEqual(answer, "42.")
+        self.assertEqual(new_items, [{"type": "message"}])
+        call_args = run_agent_turn.call_args.args
+        self.assertEqual(call_args[0], "sk-test")
+        self.assertEqual(call_args[1], "gpt-4o-mini")
+        self.assertEqual(call_args[2], 20)
+        input_items = call_args[4]
+        self.assertEqual(
+            input_items,
+            [{"role": "user", "content": "q1"}, {"type": "message"}, {"role": "user", "content": "q2"}],
+        )
     def test_no_events_reports_empty_window(self) -> None:
         store = _store()
         store.tz = ZoneInfo("UTC")
@@ -325,36 +629,6 @@ class BuildAiAskTransitionsTextTests(unittest.TestCase):
         text = _build_ai_ask_transitions_text(store, 2)
 
         self.assertIn("GLOBAL", text)
-
-
-class MakeAiAskProviderTests(unittest.TestCase):
-    def test_missing_api_key_returns_not_configured_message_without_calling_openai(self) -> None:
-        cfg = Mock(ai_api_key="", ai_model="gpt-4o-mini", ai_chat_timeout_seconds=20)
-
-        provider = _make_ai_ask_provider(cfg)
-
-        self.assertEqual(
-            provider("anything", "some context"),
-            "AI chat is not configured: set OPENAI_API_KEY in .env to enable /ask.",
-        )
-
-    @patch("gridbot.main.ask_freeform")
-    def test_forwards_question_and_context_to_ask_freeform_with_cfg_settings(self, ask_freeform: Mock) -> None:
-        ask_freeform.return_value = "Grid trading works best in ranging markets."
-        cfg = Mock(ai_api_key="sk-test", ai_model="gpt-4o-mini", ai_chat_timeout_seconds=20)
-
-        provider = _make_ai_ask_provider(cfg)
-        answer = provider("How does grid trading work?", "Bot status: RUNNING")
-
-        self.assertEqual(answer, "Grid trading works best in ranging markets.")
-        ask_freeform.assert_called_once_with(
-            "sk-test",
-            "gpt-4o-mini",
-            20,
-            ANY,
-            "How does grid trading work?",
-            context="Bot status: RUNNING",
-        )
 
 
 class ResponsiveWaitTests(unittest.TestCase):

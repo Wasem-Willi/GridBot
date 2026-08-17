@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
@@ -16,7 +18,7 @@ from gridbot.ai_filter import (
     AI_ACTION_PAUSE,
     AI_ACTION_SELL_ONLY,
     OpenAIDecisionClient,
-    ask_freeform,
+    run_agent_turn,
 )
 from gridbot.config import BotConfig, load_config
 from gridbot.exchange import (
@@ -102,7 +104,7 @@ def _apply_control_commands(
     pnl_provider: Callable[[], str],
     cancel_all_provider: Callable[[], str],
     start_fresh_provider: Callable[[], tuple[bool, str]],
-    ai_ask_provider: Callable[[str, str], str],
+    ai_ask_provider: Callable[[str, list[list[dict[str, Any]]]], tuple[str, list[dict[str, Any]]]],
 ) -> tuple[bool, bool]:
     offset_raw = store.get_state("telegram_offset")
     offset = int(offset_raw) if offset_raw is not None else 0
@@ -194,19 +196,32 @@ def _apply_control_commands(
             if not question:
                 alerter.send("Usage: /ask <question>")
             else:
-                context = _build_ai_ask_context(store, bot_halted, pnl_provider, cfg.ai_chat_history_days)
+                prior_turns = _load_ai_conversation(store)
                 try:
-                    answer = ai_ask_provider(question, context)
+                    answer, new_items = ai_ask_provider(question, prior_turns)
                     success = True
                 except (requests.RequestException, ValueError) as error:
                     answer = f"AI chat failed: {error}"
+                    new_items = []
                     success = False
+                if new_items:
+                    _save_ai_conversation(store, [*prior_turns, new_items])
+                # Action tools (kill_bot/resume_bot) write bot_halted straight to the
+                # store; resync our local copy so it isn't clobbered by the next
+                # store.set_state("bot_halted", ...) write later in the main loop.
+                halted_raw = store.get_state("bot_halted")
+                if halted_raw is not None:
+                    bot_halted = halted_raw == "1"
                 alerter.send(answer)
                 store.log_risk_event(
                     "ai_chat",
                     None,
                     {"question": question, "success": 1 if success else 0, "source": "telegram"},
                 )
+        elif command.name == "ask_reset":
+            _save_ai_conversation(store, [])
+            alerter.send("AI assistant conversation memory cleared.")
+            store.log_risk_event("ai_chat_reset", None, {"source": "telegram"})
     return bot_halted, should_stop
 
 
@@ -347,7 +362,7 @@ def _responsive_wait(
     pnl_provider: Callable[[], str],
     cancel_all_provider: Callable[[], str],
     start_fresh_provider: Callable[[], tuple[bool, str]],
-    ai_ask_provider: Callable[[str, str], str],
+    ai_ask_provider: Callable[[str, list[list[dict[str, Any]]]], tuple[str, list[dict[str, Any]]]],
 ) -> tuple[bool, bool]:
     remaining = max(wait_seconds, 0)
     step = max(poll_seconds, 1)
@@ -460,54 +475,281 @@ def _make_start_fresh_provider(
 
 
 _AI_CHAT_SYSTEM_PROMPT = (
-    "You are GridBot's AI assistant, reachable by the bot operator via Telegram /ask. "
-    "GridBot is a rule-based Binance spot grid trading bot. Each question is accompanied by "
-    "a 'Bot context' block containing the live bot status, a P/L snapshot, and the full "
-    "transition/risk-event history for a recent multi-day window (stated in the context "
-    "itself), all pulled directly from the bot at the moment of the question - use that data "
-    "to answer status/P&L/event/history questions accurately instead of guessing. If the "
-    "operator asks about something not covered by the context (e.g. specific open orders or "
-    "per-symbol grid levels, or events older than the stated window), say so plainly and "
-    "suggest /status, /pnl, or /transitions for more detail rather than inventing an answer. "
+    "You are GridBot's AI assistant, an agent reachable by the bot operator via Telegram /ask. "
+    "GridBot is a rule-based Binance spot grid trading bot. You have read-only tools to look up "
+    "live bot data on demand: get_bot_status, get_pnl_snapshot, get_transitions, get_open_orders, "
+    "get_account_balances, and get_symbol_state. Call whichever of these you need to answer the "
+    "operator's question accurately instead of guessing - do not answer status/P&L/order/balance "
+    "questions from memory or assumption when a tool can give you the real answer. "
+    "You also have action tools: cancel_all_orders, kill_bot, resume_bot, and set_notification. "
+    "These change real bot behavior, so only call one of them when the operator's *current* "
+    "message explicitly and unambiguously asks for that specific action - never speculatively, "
+    "never as a side effect of answering something else, and never based on your own judgment of "
+    "what would be good for the bot. If unsure whether the operator wants an action taken, ask for "
+    "confirmation instead of calling the tool. You cannot place, modify, or cancel individual "
+    "trade orders, and you never will - that is the deterministic grid logic's job. "
+    "You can see recent turns of this conversation, so handle natural follow-up questions. "
     "Answer clearly and concisely."
 )
 
+_AI_AGENT_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "get_bot_status",
+        "description": "Get whether the bot is currently running or halted, and its trading mode (paper/testnet/live).",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "get_pnl_snapshot",
+        "description": "Get a live account equity and P/L snapshot (day P/L and since-start P/L, in USDT and percent).",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "get_transitions",
+        "description": (
+            "Get the transition/risk-event history (pauses, resumes, stop-loss/take-profit "
+            "triggers, manual commands, errors) for the last N days."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "How many days of history to fetch."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_open_orders",
+        "description": "Get currently open spot orders, optionally filtered to one symbol.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "e.g. BTCUSDT. Omit for all symbols."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_account_balances",
+        "description": "Get non-zero account asset balances (free and locked) from the exchange.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "get_symbol_state",
+        "description": "Get a symbol's grid state: center price, lower/upper bound, paused flag, and pause reason.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "e.g. BTCUSDT"},
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "cancel_all_orders",
+        "description": (
+            "Cancel ALL open spot orders across all symbols. Only call this when the operator's "
+            "current message explicitly asks to cancel orders."
+        ),
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "kill_bot",
+        "description": (
+            "Halt the trading loop (manual kill switch). Only call this when the operator's "
+            "current message explicitly asks to stop/halt/kill the bot."
+        ),
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "resume_bot",
+        "description": (
+            "Resume the trading loop after a halt. Only call this when the operator's current "
+            "message explicitly asks to resume/restart trading."
+        ),
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "set_notification",
+        "description": (
+            "Turn a live Telegram notification category on or off (or 'all'). Only call this when "
+            "the operator's current message explicitly asks to change notification settings."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "One of: " + ", ".join(NOTIFICATION_CATEGORIES) + ", or 'all'.",
+                },
+                "enabled": {"type": "boolean"},
+            },
+            "required": ["category", "enabled"],
+            "additionalProperties": False,
+        },
+    },
+]
 
-def _build_ai_ask_context(
+_AI_TOOL_RESULT_MAX_CHARS = 2000
+_AI_CONVERSATION_MAX_TURNS = 6
+_AI_AGENT_MAX_TOOL_ROUNDS = 5
+_AI_CONVERSATION_STATE_KEY = "ai_conversation"
+
+
+def _truncate(text: str, max_chars: int = _AI_TOOL_RESULT_MAX_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"... (truncated, {len(text)} chars total)"
+
+
+def _make_ai_tool_executor(
+    cfg: BotConfig,
+    exchange: BinanceSpotClient,
     store: StateStore,
-    bot_halted: bool,
     pnl_provider: Callable[[], str],
-    history_days: int,
-) -> str:
-    """Snapshot of live bot data handed to the AI assistant alongside the
-    operator's /ask question, so answers are grounded in the bot's actual
-    current state rather than guessed. Includes the full transition/risk
-    history over `history_days` (not just the last handful of events), so
-    the assistant can answer "check the whole history" style questions."""
+    cancel_all_provider: Callable[[], str],
+) -> Callable[[str, dict[str, Any]], str]:
+    """Builds the function that executes each tool call the AI agent makes.
+    Read-only tools query live bot/exchange data; action tools reuse the
+    same providers/state-store writes as their /command equivalents and log
+    an 'ai_action' risk event for auditability. Never raises - all errors
+    are caught and returned as a result string so a single failing tool
+    call doesn't crash the whole /ask turn."""
+
+    def _execute(name: str, args: dict[str, Any]) -> str:
+        try:
+            if name == "get_bot_status":
+                halted = store.get_state("bot_halted") == "1"
+                return json.dumps({"status": "STOPPED" if halted else "RUNNING", "mode": cfg.mode})
+            if name == "get_pnl_snapshot":
+                return pnl_provider()
+            if name == "get_transitions":
+                days = int(args.get("days") or cfg.ai_chat_history_days)
+                return _truncate(_build_ai_ask_transitions_text(store, days))
+            if name == "get_open_orders":
+                if cfg.dry_run:
+                    return "Paper mode: no real open orders to report."
+                symbol = args.get("symbol") or None
+                orders = exchange.get_open_orders(symbol) if symbol else exchange.get_all_open_orders()
+                return _truncate(json.dumps(orders))
+            if name == "get_account_balances":
+                if cfg.dry_run:
+                    return "Paper mode: no real account balances to report."
+                account = exchange.get_account()
+                balances = [
+                    balance
+                    for balance in account.get("balances", [])
+                    if float(balance.get("free", 0)) > 0 or float(balance.get("locked", 0)) > 0
+                ]
+                return _truncate(json.dumps(balances))
+            if name == "get_symbol_state":
+                symbol = str(args.get("symbol", "")).strip().upper()
+                state = store.get_symbol_state(symbol)
+                if state is None:
+                    return f"No grid state recorded for {symbol}."
+                return json.dumps(
+                    {
+                        "symbol": state.symbol,
+                        "center_price": state.center_price,
+                        "lower_bound": state.lower_bound,
+                        "upper_bound": state.upper_bound,
+                        "paused": state.paused,
+                        "pause_reason": state.pause_reason,
+                        "updated_at": state.updated_at,
+                    }
+                )
+            if name == "cancel_all_orders":
+                result = cancel_all_provider()
+                store.log_risk_event("ai_action", None, {"tool": "cancel_all_orders", "result": result})
+                return result
+            if name == "kill_bot":
+                store.set_state("bot_halted", "1")
+                store.log_risk_event("ai_action", None, {"tool": "kill_bot"})
+                return "Bot halted."
+            if name == "resume_bot":
+                store.set_state("bot_halted", "0")
+                store.log_risk_event("ai_action", None, {"tool": "resume_bot"})
+                return "Bot resumed."
+            if name == "set_notification":
+                category = str(args.get("category", "")).strip().lower()
+                enabled = bool(args.get("enabled"))
+                state_word = "ON" if enabled else "OFF"
+                if category == "all":
+                    for notify_name in NOTIFICATION_CATEGORIES:
+                        store.set_state(f"notify_{notify_name}", "1" if enabled else "0")
+                elif category not in NOTIFICATION_CATEGORIES:
+                    valid = ", ".join([*NOTIFICATION_CATEGORIES, "all"])
+                    return f"Unknown notify category '{category}'. Valid: {valid}"
+                else:
+                    store.set_state(f"notify_{category}", "1" if enabled else "0")
+                store.log_risk_event(
+                    "ai_action",
+                    None,
+                    {"tool": "set_notification", "category": category, "enabled": 1 if enabled else 0},
+                )
+                return f"Notifications for '{category}' turned {state_word}."
+            return f"Unknown tool: {name}"
+        except (requests.RequestException, ValueError, KeyError) as error:
+            return f"Tool '{name}' failed: {error}"
+
+    return _execute
+
+
+def _load_ai_conversation(store: StateStore) -> list[list[dict[str, Any]]]:
+    raw = store.get_state(_AI_CONVERSATION_STATE_KEY)
+    if not raw:
+        return []
     try:
-        pnl_text = pnl_provider()
-    except (requests.RequestException, ValueError) as error:
-        pnl_text = f"P/L snapshot unavailable ({error})"
-    status = "STOPPED" if bot_halted else "RUNNING"
-    return (
-        f"Bot status: {status}\n"
-        f"{pnl_text}\n\n"
-        f"{_build_ai_ask_transitions_text(store, history_days)}"
-    )
+        turns = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(turns, list):
+        return []
+    return turns
 
 
-def _make_ai_ask_provider(cfg: BotConfig) -> Callable[[str, str], str]:
+def _save_ai_conversation(store: StateStore, turns: list[list[dict[str, Any]]]) -> None:
+    trimmed = turns[-_AI_CONVERSATION_MAX_TURNS:]
+    store.set_state(_AI_CONVERSATION_STATE_KEY, json.dumps(trimmed))
+
+
+def _make_ai_agent_provider(
+    cfg: BotConfig,
+    exchange: BinanceSpotClient,
+    store: StateStore,
+    pnl_provider: Callable[[], str],
+    cancel_all_provider: Callable[[], str],
+) -> Callable[[str, list[list[dict[str, Any]]]], tuple[str, list[dict[str, Any]]]]:
     if not cfg.ai_api_key:
-        return lambda _question, _context: "AI chat is not configured: set OPENAI_API_KEY in .env to enable /ask."
+        return lambda _question, _turns: (
+            "AI chat is not configured: set OPENAI_API_KEY in .env to enable /ask.",
+            [],
+        )
 
-    def _provider(question: str, context: str) -> str:
-        return ask_freeform(
+    tool_executor = _make_ai_tool_executor(cfg, exchange, store, pnl_provider, cancel_all_provider)
+
+    def _provider(question: str, prior_turns: list[list[dict[str, Any]]]) -> tuple[str, list[dict[str, Any]]]:
+        prior_items = [item for turn in prior_turns for item in turn]
+        input_items = [*prior_items, {"role": "user", "content": question}]
+        return run_agent_turn(
             cfg.ai_api_key,
             cfg.ai_model,
             cfg.ai_chat_timeout_seconds,
             _AI_CHAT_SYSTEM_PROMPT,
-            question,
-            context=context,
+            input_items,
+            _AI_AGENT_TOOLS,
+            tool_executor,
+            max_tool_rounds=_AI_AGENT_MAX_TOOL_ROUNDS,
         )
 
     return _provider
@@ -528,7 +770,9 @@ def _build_help_text() -> str:
         "/notify - show live notification toggle status\n"
         "/notify_on <category|all> - turn a notification category (or all) on\n"
         "/notify_off <category|all> - turn a notification category (or all) off\n"
-        "/ask <question> - ask the AI assistant a question"
+        "/ask <question> - ask the AI assistant a question (it can look up live bot data and, "
+        "if you explicitly ask, cancel orders / kill / resume / toggle notifications)\n"
+        "/ask_reset - clear the AI assistant's conversation memory"
     )
 
 
@@ -885,7 +1129,7 @@ def run() -> None:
     pnl_provider = _make_pnl_provider(cfg, exchange, store)
     cancel_all_provider = _make_cancel_all_provider(cfg, exchange)
     start_fresh_provider = _make_start_fresh_provider(cfg, exchange, store)
-    ai_ask_provider = _make_ai_ask_provider(cfg)
+    ai_ask_provider = _make_ai_agent_provider(cfg, exchange, store, pnl_provider, cancel_all_provider)
     regime = RegimeController(cfg, exchange, store, alerter)
     ai_filter = AIFilterController(cfg, store, alerter)
     logging.info("Regime filter mode=%s", cfg.regime_filter_mode)

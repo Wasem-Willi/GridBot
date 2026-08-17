@@ -84,6 +84,7 @@ docker compose logs -f gridbot
 - `/notify_on <category|all>` - turn a notification category (or all) on
 - `/notify_off <category|all>` - turn a notification category (or all) off
 - `/ask <question>` - ask the AI assistant a free-text question (requires `OPENAI_API_KEY`)
+- `/ask_reset` - clear the AI assistant's conversation memory
 
 ### Live notification toggles
 
@@ -197,24 +198,40 @@ Env keys:
 - `AI_PROMPT_PATH` (for example `docs/openai-decision-spec.md`)
 - `AI_TIMEOUT_SECONDS` (default `2`)
 - `AI_RECOMPUTE_SECONDS` (default `300`)
-- `AI_CHAT_TIMEOUT_SECONDS` (default `20`) - timeout for the `/ask` command below
-- `AI_CHAT_HISTORY_DAYS` (default `2`) - how many days of transition/risk-event history `/ask` includes in its context
+- `AI_CHAT_TIMEOUT_SECONDS` (default `20`) - per-request timeout for the `/ask` command below
+- `AI_CHAT_HISTORY_DAYS` (default `2`) - how many days of history the `get_transitions` tool returns by default
 
 ### Ask the AI assistant (`/ask`)
 
-Independent of `AI_FILTER_MODE`, send `/ask <question>` in Telegram to get a
-free-text answer from the same OpenAI model (`AI_MODEL`), reusing the
-`OPENAI_API_KEY`. Every question is sent along with a live "bot context"
-snapshot pulled fresh from the store at the moment of the question: current
-bot status (running/halted), a P/L snapshot, and the **full** transition/risk
-event history for the last `AI_CHAT_HISTORY_DAYS` days (default 2, capped at
-500 events as a safety net) - not just the last few events shown by
-`/transitions`. This lets it answer "what happened over the last couple of
-days?" style questions directly instead of only seeing a fixed last-10
-window. It still has no access to specific open orders or per-symbol grid
-levels, and never places orders or changes bot behavior - it's a read-only
-Q&A helper. If `OPENAI_API_KEY` is not set, `/ask` replies that AI chat isn't
-configured instead of failing silently.
+Independent of `AI_FILTER_MODE`, send `/ask <question>` in Telegram to talk
+to an AI **agent** (same OpenAI model, `AI_MODEL`, reusing `OPENAI_API_KEY`)
+that can look up live bot data on its own instead of guessing, and remembers
+the last few turns of your conversation so natural follow-up questions work
+(e.g. "what about ETHUSDT?" after asking about BTCUSDT). Send `/ask_reset`
+to clear that memory if it ever gets confused or stale.
+
+The agent has two kinds of tools:
+
+- **Read-only lookups** it can call any time it needs real data: bot
+  status, a live P/L snapshot, transition/risk-event history (last N days,
+  `AI_CHAT_HISTORY_DAYS` by default, capped at 500 events), open orders
+  (all symbols or one), account balances, and a symbol's grid state
+  (center price, bounds, paused/reason).
+- **Actions** - `cancel_all_orders`, `kill_bot`, `resume_bot`, and
+  `set_notification` - the same operations behind `/cancel_all`, `/kill`,
+  `/resume`, and `/notify_on`/`/notify_off`. The system prompt instructs the
+  agent to only call these when your message explicitly asks for that
+  specific action, never on its own initiative or as a side effect of
+  answering something else. Every action call is logged as an `ai_action`
+  risk event (visible via `/transitions`) for auditability.
+
+The agent **cannot** place, modify, or cancel individual trade orders -
+that stays exclusively the deterministic grid logic's job. A multi-tool
+turn can take a few OpenAI round trips, so a single `/ask` reply may take
+noticeably longer than the other commands (up to `AI_CHAT_TIMEOUT_SECONDS`
+per round trip, capped at 5 rounds) and will briefly block the bot's main
+loop while it runs. If `OPENAI_API_KEY` is not set, `/ask` replies that AI
+chat isn't configured instead of failing silently.
 
 ## 8) Current v1 scope notes
 

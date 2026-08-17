@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -127,46 +128,83 @@ class OpenAIDecisionClient:
         return AIDecision(action=action, confidence=confidence, reason=reason)
 
 
-def ask_freeform(
+def run_agent_turn(
     api_key: str,
     model: str,
     timeout_seconds: int,
     system_prompt: str,
-    question: str,
-    context: str | None = None,
-) -> str:
-    """Send a freeform question to the OpenAI Responses API and return the
-    plain-text answer. Unlike OpenAIDecisionClient.decide, the response is
-    not constrained to a JSON schema, so this is used for interactive
-    chat (e.g. a Telegram /ask command) rather than bot decisions.
+    input_items: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    tool_executor: Callable[[str, dict[str, Any]], str],
+    max_tool_rounds: int = 5,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Run one turn of an agentic OpenAI Responses API conversation that may
+    involve tool (function) calls, used by the Telegram /ask command.
 
-    If context is provided (a snapshot of live bot data such as P/L and
-    recent risk events), it is included alongside the question so the model
-    can ground its answer in the bot's actual current state."""
-    input_text = question if not context else f"Bot context:\n{context}\n\nOperator question: {question}"
+    `input_items` is the full conversation so far (prior turns' items, if
+    any) with the new user message already appended as the last item.
+    `tools` are OpenAI function-tool schemas; `tool_executor(name, args)` is
+    called for each function_call the model makes and must return a plain
+    string result (it should catch its own errors and return an error
+    string rather than raising, since this loop does not wrap it).
+
+    The model/tool exchange repeats until the model returns a final message
+    with no further function calls, or `max_tool_rounds` is exceeded (raises
+    ValueError - callers should treat this like any other AI chat failure).
+
+    Returns (final_answer_text, new_items), where new_items are every item
+    generated during this turn (the model's function_call/message items and
+    the tool outputs) - callers should append these to the persisted
+    conversation history, after the user message that was already the last
+    item of input_items."""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    body = {
-        "model": model,
-        "instructions": system_prompt,
-        "input": input_text,
-    }
-    response = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers=headers,
-        json=body,
-        timeout=timeout_seconds,
-    )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as error:
-        raise ValueError(
-            f"OpenAI request failed (status={response.status_code}): "
-            f"{_openai_error_message(response)}"
-        ) from error
-    result = response.json()
-    if not isinstance(result, dict):
-        raise ValueError("OpenAI response must be an object")
-    return _response_output_text(result).strip()
+    working_input = list(input_items)
+    turn_start_len = len(working_input)
+    endpoint = "https://api.openai.com/v1/responses"
+    for _ in range(max_tool_rounds):
+        body = {
+            "model": model,
+            "instructions": system_prompt,
+            "input": working_input,
+            "tools": tools,
+        }
+        response = requests.post(endpoint, headers=headers, json=body, timeout=timeout_seconds)
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as error:
+            raise ValueError(
+                f"OpenAI request failed (status={response.status_code}): "
+                f"{_openai_error_message(response)}"
+            ) from error
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("OpenAI response must be an object")
+        output = result.get("output")
+        if not isinstance(output, list):
+            raise ValueError("OpenAI response missing output")
+        working_input.extend(output)
+        function_calls = [item for item in output if isinstance(item, dict) and item.get("type") == "function_call"]
+        if not function_calls:
+            answer = _response_output_text(result).strip()
+            return answer, working_input[turn_start_len:]
+        for call in function_calls:
+            name = str(call.get("name", ""))
+            call_id = str(call.get("call_id", ""))
+            try:
+                args = json.loads(call.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            if not isinstance(args, dict):
+                args = {}
+            tool_output = tool_executor(name, args)
+            working_input.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": tool_output,
+                }
+            )
+    raise ValueError(f"AI agent exceeded {max_tool_rounds} tool-call rounds without a final answer")

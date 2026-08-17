@@ -54,6 +54,11 @@ class PollCommandsNotifyParsingTests(unittest.TestCase):
         commands, _ = alerter.poll_commands(0)
         self.assertEqual(commands, [ControlCommand(name="ask", arg="")])
 
+    def test_ask_reset_maps_to_ask_reset_command(self) -> None:
+        alerter = _alerter_with_response(["/ask_reset"])
+        commands, _ = alerter.poll_commands(0)
+        self.assertEqual(commands, [ControlCommand(name="ask_reset")])
+
 
 if __name__ == "__main__":
     unittest.main()

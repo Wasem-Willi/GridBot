@@ -66,6 +66,8 @@ class TelegramAlerter:
                 commands.append(ControlCommand(name="notify_on", arg=text[len("/notify_on"):].strip()))
             elif text.startswith("/notify_off"):
                 commands.append(ControlCommand(name="notify_off", arg=text[len("/notify_off"):].strip()))
+            elif text == "/ask_reset":
+                commands.append(ControlCommand(name="ask_reset"))
             elif text.startswith("/ask"):
                 commands.append(ControlCommand(name="ask", arg=text[len("/ask"):].strip()))
             else:
